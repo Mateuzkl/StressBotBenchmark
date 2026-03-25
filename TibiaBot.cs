@@ -4,7 +4,6 @@ using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using StressBotBenchmark.Network;
-using System.Net.Http;
 
 namespace StressBotBenchmark
 {
@@ -15,13 +14,12 @@ namespace StressBotBenchmark
         private readonly BotConfig _config;
         private readonly BotMetrics _metrics;
         private readonly uint[] _xteaKey = new uint[4];
-        private static readonly HttpClient _httpClient = new HttpClient();
-        
         private TcpClient? _client;
         private NetworkStream? _stream;
         private CancellationTokenSource? _cts;
         private readonly SemaphoreSlim _writeLock = new SemaphoreSlim(1, 1);
         private bool _inWorld = false;
+        private DateTime _lastPingbackTime = DateTime.MinValue;
 
         public TibiaBot(string name, string password, BotConfig config, BotMetrics metrics)
         {
@@ -32,6 +30,7 @@ namespace StressBotBenchmark
             var rand = new Random();
             for (int i = 0; i < 4; i++) _xteaKey[i] = (uint)rand.Next();
         }
+
 
         public string Name => _name;
         public bool InWorld => _inWorld;
@@ -53,13 +52,6 @@ namespace StressBotBenchmark
                 _cts = new CancellationTokenSource();
                 try
                 {
-                    bool loggedIn = await ApiLoginAsync(_cts.Token);
-                    if (!loggedIn)
-                    {
-                        if (!_config.Reconnect) break;
-                        try { await Task.Delay(3000, _cts.Token); } catch { break; }
-                        continue;
-                    }
                     await ConnectAndRunAsync(_cts.Token);
                 }
                 catch (OperationCanceledException) { }
@@ -85,27 +77,6 @@ namespace StressBotBenchmark
             _client?.Close();
         }
 
-        private async Task<bool> ApiLoginAsync(CancellationToken token)
-        {
-            string payload = $"{{\"emailOrUsername\":\"{_name}\",\"password\":\"{_password}\"}}";
-            var content = new StringContent(payload, System.Text.Encoding.UTF8, "application/json");
-            try
-            {
-                var response = await _httpClient.PostAsync(_config.ApiLoginUrl, content, token);
-                if (!response.IsSuccessStatusCode)
-                {
-                    string err = await response.Content.ReadAsStringAsync();
-                    Console.WriteLine($"[API Error {_name}] HTTP {response.StatusCode} - {err}");
-                }
-                return response.IsSuccessStatusCode;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[API Exception {_name}] {ex.Message}");
-                return false;
-            }
-        }
-
         private async Task ConnectAndRunAsync(CancellationToken token)
         {
             _client = new TcpClient();
@@ -113,54 +84,128 @@ namespace StressBotBenchmark
             _stream = _client.GetStream();
             _inWorld = false; // Reset
 
-            byte[] challengeMsg = await ReadMessageAsync(token);
+            byte[] challengeMsg;
+            try
+            {
+                challengeMsg = await ReadMessageAsync(token);
+            }
+            catch (EndOfStreamException)
+            {
+                throw new Exception("Server closed connection before sending challenge (connection limit? server not running?)");
+            }
+
             if (challengeMsg.Length < 12 || challengeMsg[6] != 0x1F)
-                throw new Exception("Invalid challenge received");
+            {
+                // Maybe server sent a disconnect message (unencrypted 0x14)
+                if (challengeMsg.Length >= 4 && challengeMsg[0] == 0x14)
+                {
+                    var errMsg = new InputMessage(challengeMsg, 1, challengeMsg.Length);
+                    throw new Exception($"Server rejected (pre-login): {errMsg.GetString()}");
+                }
+                string hex = BitConverter.ToString(challengeMsg, 0, Math.Min(challengeMsg.Length, 20));
+                throw new Exception($"Invalid challenge (len={challengeMsg.Length}, hex={hex})");
+            }
             
             uint ts = BitConverter.ToUInt32(challengeMsg, 7);
             byte rand = challengeMsg[11];
 
             await SendLoginMessageAsync(ts, rand, token);
 
-            var readTask = ReadLoopAsync(token);
-            var walkTask = WalkLoopAsync(token);
-            var chatTask = ChatLoopAsync(token);
-            var spellTask = SpellLoopAsync(token);
-            var attackTask = AttackLoopAsync(token);
+            // Read first response - could be encrypted game data or disconnect
+            byte[] firstResponse;
+            try
+            {
+                firstResponse = await ReadMessageAsync(token);
+            }
+            catch (EndOfStreamException)
+            {
+                throw new Exception("Server closed connection after login (RSA decrypt failed? wrong protocol version?)");
+            }
 
-            Task completedTask = await Task.WhenAny(readTask, walkTask, chatTask, spellTask, attackTask);
-            _cts?.Cancel();
-            await completedTask; // Re-throw if the completed task failed!
+            // Try to parse first response - check for unencrypted disconnect (0x14)
+            if (firstResponse.Length >= 4 && firstResponse[0] == 0x14)
+            {
+                var errMsg = new InputMessage(firstResponse, 1, firstResponse.Length);
+                throw new Exception($"Server rejected: {errMsg.GetString()}");
+            }
+
+            // Process first encrypted response normally
+            ProcessEncryptedPacket(firstResponse);
+
+            var readTask = ReadLoopAsync(token);
+
+            if (_config.LoginOnly)
+            {
+                // Login-only mode: just maintain connection and respond to pings
+                await readTask;
+            }
+            else
+            {
+                var walkTask = WalkLoopAsync(token);
+                var chatTask = ChatLoopAsync(token);
+                var spellTask = SpellLoopAsync(token);
+                var attackTask = AttackLoopAsync(token);
+
+                Task completedTask = await Task.WhenAny(readTask, walkTask, chatTask, spellTask, attackTask);
+                _cts?.Cancel();
+                await completedTask;
+            }
+        }
+
+        private void ProcessEncryptedPacket(byte[] body)
+        {
+            if (body.Length < 6) return;
+            byte[] encrypted = new byte[body.Length - 4];
+            Array.Copy(body, 4, encrypted, 0, encrypted.Length);
+            if (encrypted.Length % 8 != 0) return;
+            Xtea.Decrypt(encrypted, _xteaKey);
+
+            var msg = new InputMessage(encrypted);
+            ushort innerLen = msg.GetU16();
+            int end = Math.Min(msg.Position + innerLen, encrypted.Length);
+            var payload = new InputMessage(encrypted, msg.Position, end);
+
+            // Check for disconnect opcode
+            if (payload.Remaining > 0)
+            {
+                int savedPos = payload.Position;
+                byte op = payload.GetU8();
+                if (op == 0x14)
+                {
+                    string reason = payload.GetString();
+                    Console.WriteLine($"[Bot {_name}] Server rejected (encrypted): {reason}");
+                }
+            }
         }
 
         private async Task SendLoginMessageAsync(uint ts, byte rand, CancellationToken token)
         {
+            // Protocolo Tibia 8.60 / TFS 1.8
             var rsaBytes = new OutputMessage();
-            rsaBytes.AddU8(0);
-            for (int i = 0; i < 4; i++) rsaBytes.AddU32(_xteaKey[i]);
-            rsaBytes.AddU8(0); // MISSING BYTE FOUND in padding specification
-            long tokenTime = DateTimeOffset.UtcNow.ToUnixTimeSeconds() / 30;
-            rsaBytes.AddString($"{_name}\n{_password}\n\n{tokenTime}");
-            rsaBytes.AddString(_name);
-            rsaBytes.AddU32(ts);
-            rsaBytes.AddU8(rand);
-            
+            rsaBytes.AddU8(0);                                    // RSA check byte
+            for (int i = 0; i < 4; i++) rsaBytes.AddU32(_xteaKey[i]); // XTEA key
+            rsaBytes.AddU8(0);                                    // gamemaster flag (0 = jogador normal)
+            rsaBytes.AddString(_name);                            // account name
+            rsaBytes.AddString(_name);                            // character name (igual ao account)
+            rsaBytes.AddString(_password);                        // password
+            rsaBytes.AddU32(ts);                                  // challenge timestamp
+            rsaBytes.AddU8(rand);                                 // challenge random
+
             byte[] rawRsa = rsaBytes.GetBuffer();
             byte[] paddedRsa = new byte[128];
             Array.Copy(rawRsa, paddedRsa, rawRsa.Length);
             byte[] encryptedRsa = Rsa.Encrypt(paddedRsa);
 
             var msg = new OutputMessage();
-            msg.AddU16(3); // OS
-            msg.AddU16(1098); // Protocol
-            msg.AddBytes(new byte[7]);
+            msg.AddU16(2);    // OS: 2 = Windows
+            msg.AddU16(860);  // Protocol version 8.60
             msg.AddBytes(encryptedRsa);
 
             var payload = msg.GetBuffer();
             byte[] final = new byte[payload.Length + 3];
             final[0] = (byte)((payload.Length + 1) & 0xFF);
             final[1] = (byte)(((payload.Length + 1) >> 8) & 0xFF);
-            final[2] = 0x00;
+            final[2] = 0x0A; // Game protocol ID
             Array.Copy(payload, 0, final, 3, payload.Length);
             
             _metrics.AddBytesOut(final.Length);
@@ -276,12 +321,27 @@ namespace StressBotBenchmark
                 }
             }
 
-            while (payload.Remaining > 0)
+            // Only parse the FIRST opcode. We cannot walk through sub-messages
+            // without a full protocol parser. Reading every byte as an opcode
+            // causes false 0x1D matches (~1/256 bytes) that flood the server
+            // with hundreds of spurious pingback packets per second.
+            if (payload.Remaining > 0)
             {
                 byte op = payload.GetU8();
+                if (op == 0x14) // DISCONNECT MESSAGE
+                {
+                    string reason = payload.GetString();
+                    Console.WriteLine($"[Bot {_name}] Server rejected: {reason}");
+                    return;
+                }
                 if (op == 0x1D) // PING
                 {
-                    await SendPingBackAsync(token);
+                    var now = DateTime.UtcNow;
+                    if ((now - _lastPingbackTime).TotalMilliseconds >= _config.PingbackMinIntervalMs)
+                    {
+                        _lastPingbackTime = now;
+                        await SendPingBackAsync(token);
+                    }
                 }
             }
         }

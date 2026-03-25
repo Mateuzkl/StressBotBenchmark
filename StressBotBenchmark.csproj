@@ -8,6 +8,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <DefaultItemExcludes>$(DefaultItemExcludes);ExtractRsa\**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>

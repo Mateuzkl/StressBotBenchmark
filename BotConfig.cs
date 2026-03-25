@@ -4,9 +4,8 @@ namespace StressBotBenchmark
     {
         public string Host { get; set; } = "127.0.0.1";
         public int Port { get; set; } = 7172;
-        public string ApiLoginUrl { get; set; } = "http://127.0.0.1:5185/auth/login";
-        
-        public int BotCount { get; set; } = 1000;
+
+        public int BotCount { get; set; } = 100;
         public string Prefix { get; set; } = "stressbot";
         public string Password { get; set; } = "test123";
         public int AccountWidth { get; set; } = 3;
@@ -18,13 +17,13 @@ namespace StressBotBenchmark
         public double WalkIntervalMs { get; set; } = 1500;
         public double ChatIntervalMs { get; set; } = 5000;
         public double SpellIntervalMs { get; set; } = 5000;
-        public double AttackScanIntervalMs { get; set; } = 800;
+        public double AttackScanIntervalMs { get; set; } = 2000;
         
         public string SpellText { get; set; } = "exevo gran mas flam";
         public bool EnableRandomWalk { get; set; } = false;
         public bool EnableChat { get; set; } = false;
-        public bool EnableSpell { get; set; } = true;
-        public bool EnableAttack { get; set; } = true;
+        public bool EnableSpell { get; set; } = false;
+        public bool EnableAttack { get; set; } = false;
         public bool EnableChaseMode { get; set; } = true;
         
         public byte FightMode { get; set; } = 1; // 1 = Offensive
@@ -36,5 +35,6 @@ namespace StressBotBenchmark
         
         public int QueueSize { get; set; } = 32;
         public int MaxSendLagMsToDrop { get; set; } = 1200;
+        public double PingbackMinIntervalMs { get; set; } = 5000;
     }
 }
