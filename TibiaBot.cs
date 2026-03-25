@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
@@ -25,6 +26,8 @@ namespace StressBotBenchmark
         private volatile bool _disposed = false;
         private DateTime _lastPingbackTime = DateTime.MinValue;
         private int _reconnectAttempts = 0;
+        private string? _lastError = null;
+        private bool _permanentFailure = false;
 
         public TibiaBot(string name, string password, BotConfig config, BotMetrics metrics)
         {
@@ -44,7 +47,9 @@ namespace StressBotBenchmark
         public DateTime LastSpellTime { get; private set; } = DateTime.MinValue;
         public DateTime LastAttackTime { get; private set; } = DateTime.MinValue;
         public DateTime LastDamageTakenTime { get; private set; } = DateTime.MinValue;
-        
+        public string? LastError => _lastError;
+        public bool PermanentFailure => _permanentFailure;
+
         public int TrackedMonstersTotal => _allSeenMonsters.Count;
 
         private bool _running = false;
@@ -64,7 +69,19 @@ namespace StressBotBenchmark
                 catch (OperationCanceledException) { }
                 catch (Exception e)
                 {
-                    Console.WriteLine($"[Bot {_name}] Disconnected/Error: {e.Message}");
+                    // Se _lastError já contém erro do servidor (ex: auth fail via encrypted packet),
+                    // usar ele. Senão usar e.Message (erro de conexão/stream).
+                    string errorMsg = _lastError ?? e.Message;
+                    _lastError = errorMsg;
+
+                    // Erros permanentes: não adianta reconectar
+                    if (IsPermanentError(errorMsg))
+                    {
+                        _permanentFailure = true;
+                        _metrics.IncDisconnects();
+                        break;
+                    }
+
                     if (!_config.Reconnect) break;
                     _metrics.IncDisconnects();
                     _metrics.IncReconnects();
@@ -78,6 +95,16 @@ namespace StressBotBenchmark
                     CleanupConnection();
                 }
             }
+        }
+
+        private static bool IsPermanentError(string message)
+        {
+            // Erros que o servidor envia e que nunca vão mudar com retry
+            return message.Contains("password is not correct", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("account name or password", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("account has been banned", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("character is not", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("does not exist", StringComparison.OrdinalIgnoreCase);
         }
 
         public void Stop()
@@ -107,6 +134,8 @@ namespace StressBotBenchmark
 
         private async Task ConnectAndRunAsync(CancellationToken token)
         {
+            _lastError = null; // Reset antes de cada tentativa
+
             _client = new TcpClient
             {
                 NoDelay = true,
@@ -209,7 +238,7 @@ namespace StressBotBenchmark
                 if (op == 0x14)
                 {
                     string reason = payload.GetString();
-                    Console.WriteLine($"[Bot {_name}] Server rejected (encrypted): {reason}");
+                    _lastError = reason;
                 }
             }
         }
@@ -370,7 +399,7 @@ namespace StressBotBenchmark
                 if (op == 0x14)
                 {
                     string reason = payload.GetString();
-                    Console.WriteLine($"[Bot {_name}] Server rejected: {reason}");
+                    _lastError = reason;
                     return;
                 }
                 if (op == 0x1D)
@@ -491,23 +520,42 @@ namespace StressBotBenchmark
 
         private async Task SpellLoopAsync(CancellationToken token)
         {
-            if (!_config.EnableSpell) { await Task.Delay(-1, token); return; }
-            Random rand = new Random();
+            var voc = _config.VocationConfig;
+            var slots = new[] { voc.Spell1, voc.Spell2, voc.Spell3, voc.Spell4 }
+                .Where(s => s.Enabled && !string.IsNullOrEmpty(s.SpellText))
+                .ToArray();
+
+            // Fallback: se não há slots configurados, usa o SpellText legacy
+            if (slots.Length == 0)
+            {
+                if (!_config.EnableSpell) { await Task.Delay(-1, token); return; }
+                slots = new[] { new SpellSlot { Enabled = true, SpellText = _config.SpellText, IntervalMs = (int)_config.SpellIntervalMs } };
+            }
+
+            var rand = new Random();
+            var lastCast = new DateTime[slots.Length];
             await Task.Delay(rand.Next(200, 2000), token);
 
             while (!token.IsCancellationRequested)
             {
-                int jitter = rand.Next((int)(-(_config.SpellIntervalMs * 0.2)), (int)(_config.SpellIntervalMs * 0.2));
-                await Task.Delay((int)_config.SpellIntervalMs + jitter, token);
+                await Task.Delay(500, token); // tick rate
                 if (!_inWorld) continue;
-                
-                var msg = new OutputMessage();
-                msg.AddU8(0x96); // TALK
-                msg.AddU8(1);
-                msg.AddString(_config.SpellText);
-                await SendRawGameMessageAsync(msg, token);
-                _metrics.IncSpells();
-                LastSpellTime = DateTime.UtcNow;
+
+                for (int i = 0; i < slots.Length; i++)
+                {
+                    var slot = slots[i];
+                    if ((DateTime.UtcNow - lastCast[i]).TotalMilliseconds < slot.IntervalMs) continue;
+
+                    var msg = new OutputMessage();
+                    msg.AddU8(0x96); // TALK
+                    msg.AddU8(1);
+                    msg.AddString(slot.SpellText);
+                    await SendRawGameMessageAsync(msg, token);
+                    _metrics.IncSpells();
+                    lastCast[i] = DateTime.UtcNow;
+                    LastSpellTime = DateTime.UtcNow;
+                    break; // uma spell por tick para não spammar
+                }
             }
         }
 
