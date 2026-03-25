@@ -143,7 +143,7 @@ namespace StressBotBenchmark
                         );
 
                         var panel = new Panel(table)
-                            .Header("[bold yellow]Tibia 10.98 StressBot Cluster[/]")
+                            .Header("[bold yellow]Tibia 8.60 StressBot Cluster[/]")
                             .Border(BoxBorder.Double);
 
                         ctx.UpdateTarget(panel);

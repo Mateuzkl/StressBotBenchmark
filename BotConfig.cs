@@ -10,9 +10,9 @@ namespace StressBotBenchmark
         public string Password { get; set; } = "test123";
         public int AccountWidth { get; set; } = 3;
         
-        public double LoginDelayMs { get; set; } = 15;
-        public int BurstSize { get; set; } = 20;
-        public double BurstPauseMs { get; set; } = 300;
+        public double LoginDelayMs { get; set; } = 100;
+        public int BurstSize { get; set; } = 5;
+        public double BurstPauseMs { get; set; } = 1000;
         
         public double WalkIntervalMs { get; set; } = 1500;
         public double ChatIntervalMs { get; set; } = 5000;

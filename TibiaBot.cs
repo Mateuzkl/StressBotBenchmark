@@ -7,8 +7,11 @@ using StressBotBenchmark.Network;
 
 namespace StressBotBenchmark
 {
-    public class TibiaBot
+    public class TibiaBot : IDisposable
     {
+        private const int MaxPacketSize = 65535; // Tibia max packet
+        private const int ConnectTimeoutMs = 5000;
+
         private readonly string _name;
         private readonly string _password;
         private readonly BotConfig _config;
@@ -17,9 +20,11 @@ namespace StressBotBenchmark
         private TcpClient? _client;
         private NetworkStream? _stream;
         private CancellationTokenSource? _cts;
-        private readonly SemaphoreSlim _writeLock = new SemaphoreSlim(1, 1);
-        private bool _inWorld = false;
+        private readonly SemaphoreSlim _writeLock = new(1, 1);
+        private volatile bool _inWorld = false;
+        private volatile bool _disposed = false;
         private DateTime _lastPingbackTime = DateTime.MinValue;
+        private int _reconnectAttempts = 0;
 
         public TibiaBot(string name, string password, BotConfig config, BotMetrics metrics)
         {
@@ -47,12 +52,14 @@ namespace StressBotBenchmark
         public async Task StartAsync()
         {
             _running = true;
-            while (_running)
+            var rand = new Random();
+            while (_running && !_disposed)
             {
                 _cts = new CancellationTokenSource();
                 try
                 {
                     await ConnectAndRunAsync(_cts.Token);
+                    _reconnectAttempts = 0;
                 }
                 catch (OperationCanceledException) { }
                 catch (Exception e)
@@ -61,11 +68,14 @@ namespace StressBotBenchmark
                     if (!_config.Reconnect) break;
                     _metrics.IncDisconnects();
                     _metrics.IncReconnects();
-                    try { await Task.Delay(3000); } catch { }
+                    _reconnectAttempts++;
+                    int backoffMs = Math.Min(2000 * (1 << Math.Min(_reconnectAttempts - 1, 4)), 30000);
+                    int jitter = rand.Next(0, backoffMs / 2);
+                    try { await Task.Delay(backoffMs + jitter); } catch { }
                 }
                 finally
                 {
-                    _client?.Close();
+                    CleanupConnection();
                 }
             }
         }
@@ -74,15 +84,41 @@ namespace StressBotBenchmark
         {
             _running = false;
             _cts?.Cancel();
-            _client?.Close();
+            CleanupConnection();
+        }
+
+        private void CleanupConnection()
+        {
+            _inWorld = false;
+            try { _stream?.Dispose(); } catch { }
+            try { _client?.Dispose(); } catch { }
+            _stream = null;
+            _client = null;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            Stop();
+            _cts?.Dispose();
+            _writeLock.Dispose();
         }
 
         private async Task ConnectAndRunAsync(CancellationToken token)
         {
-            _client = new TcpClient();
-            await _client.ConnectAsync(_config.Host, _config.Port, token);
+            _client = new TcpClient
+            {
+                NoDelay = true,
+                SendTimeout = 5000,
+                ReceiveTimeout = 30000
+            };
+
+            using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+            connectCts.CancelAfter(ConnectTimeoutMs);
+            await _client.ConnectAsync(_config.Host, _config.Port, connectCts.Token);
             _stream = _client.GetStream();
-            _inWorld = false; // Reset
+            _inWorld = false;
 
             byte[] challengeMsg;
             try
@@ -221,18 +257,24 @@ namespace StressBotBenchmark
 
         private async Task<byte[]> ReadMessageAsync(CancellationToken token)
         {
+            var stream = _stream ?? throw new InvalidOperationException("Stream closed");
             byte[] sizeHeader = new byte[2];
             int read = 0;
-            while(read < 2) {
-                int r = await _stream!.ReadAsync(sizeHeader, read, 2 - read, token);
+            while (read < 2)
+            {
+                int r = await stream.ReadAsync(sizeHeader, read, 2 - read, token);
                 if (r == 0) throw new EndOfStreamException();
                 read += r;
             }
             int size = sizeHeader[0] | (sizeHeader[1] << 8);
+            if (size <= 0 || size > MaxPacketSize)
+                throw new InvalidDataException($"Invalid packet size: {size}");
+
             byte[] body = new byte[size];
             read = 0;
-            while(read < size) {
-                int r = await _stream.ReadAsync(body, read, size - read, token);
+            while (read < size)
+            {
+                int r = await stream.ReadAsync(body, read, size - read, token);
                 if (r == 0) throw new EndOfStreamException();
                 read += r;
             }
@@ -276,65 +318,62 @@ namespace StressBotBenchmark
                 _fightModesSent = false;
             }
 
-            // Fast heuristic scanner for Monster IDs (0x40000000 - 0x50000000)
-            int length = payload.Remaining;
-            int offset = payload.Position;
-            byte[] buf = payload.Buffer;
-            for (int i = 0; i <= length - 4; i++)
+            // Only run heuristic scanners when their features are actually enabled.
+            // This avoids wasting CPU scanning every packet when attack/engagement is off.
+            if (_config.EnableAttack)
             {
-                uint val = BitConverter.ToUInt32(buf, offset + i);
-                // Tighten heuristic: 0x40XXXXXX where the 3rd byte is < 0x20.
-                // This allows 2 million unique monster spawns per server restart, 
-                // but mathematically filters out 99.9% of random map/string collisions!
-                if (val >= 0x40000000 && val <= 0x401FFFFF)
+                int length = payload.Remaining;
+                int offset = payload.Position;
+                byte[] buf = payload.Buffer;
+
+                // Monster ID heuristic scanner
+                for (int i = 0; i <= length - 4; i++)
                 {
-                    lock (_monsterLock) 
+                    uint val = BitConverter.ToUInt32(buf, offset + i);
+                    if (val >= 0x40000000 && val <= 0x401FFFFF)
                     {
-                        _allSeenMonsters.Add(val);
-                        if (!_recentMonsters.Contains(val))
+                        lock (_monsterLock)
                         {
-                            _recentMonsters.Add(val);
-                            if (_recentMonsters.Count > 10) _recentMonsters.RemoveAt(0); // Keep last 10 unique IDs
+                            _allSeenMonsters.Add(val);
+                            if (!_recentMonsters.Contains(val))
+                            {
+                                _recentMonsters.Add(val);
+                                if (_recentMonsters.Count > 10) _recentMonsters.RemoveAt(0);
+                            }
                         }
+                    }
+                }
+
+                // Damage heuristic scanner
+                for (int i = 0; i <= length - 11; i++)
+                {
+                    if (buf[offset + i] == 89 && buf[offset + i + 1] == 111 && buf[offset + i + 2] == 117 &&
+                        buf[offset + i + 3] == 32 && buf[offset + i + 4] == 108 && buf[offset + i + 5] == 111 &&
+                        buf[offset + i + 6] == 115 && buf[offset + i + 7] == 101 && buf[offset + i + 8] == 32)
+                    {
+                        LastDamageTakenTime = DateTime.UtcNow;
+                    }
+                    if (buf[offset + i] == 121 && buf[offset + i + 1] == 111 && buf[offset + i + 2] == 117 &&
+                        buf[offset + i + 3] == 114 && buf[offset + i + 4] == 32 && buf[offset + i + 5] == 97 &&
+                        buf[offset + i + 6] == 116 && buf[offset + i + 7] == 116 && buf[offset + i + 8] == 97 &&
+                        buf[offset + i + 9] == 99 && buf[offset + i + 10] == 107)
+                    {
+                        LastAttackTime = DateTime.UtcNow;
                     }
                 }
             }
 
-            // Heuristic scanner for taking damage ("You lose ") and dealing damage ("your attack")
-            // 'Y'=89, 'o'=111, 'u'=117, ' '=32, 'l'=108, 'o'=111, 's'=115, 'e'=101, ' '=32
-            // 'y'=121, 'o'=111, 'u'=117, 'r'=114, ' '=32,  'a'=97,  't'=116, 't'=116, 'a'=97, 'c'=99, 'k'=107
-            for (int i = 0; i <= length - 11; i++)
-            {
-                if (buf[offset + i] == 89 && buf[offset + i + 1] == 111 && buf[offset + i + 2] == 117 &&
-                    buf[offset + i + 3] == 32 && buf[offset + i + 4] == 108 && buf[offset + i + 5] == 111 &&
-                    buf[offset + i + 6] == 115 && buf[offset + i + 7] == 101 && buf[offset + i + 8] == 32)
-                {
-                    LastDamageTakenTime = DateTime.UtcNow;
-                }
-
-                if (buf[offset + i] == 121 && buf[offset + i + 1] == 111 && buf[offset + i + 2] == 117 &&
-                    buf[offset + i + 3] == 114 && buf[offset + i + 4] == 32 && buf[offset + i + 5] == 97 &&
-                    buf[offset + i + 6] == 116 && buf[offset + i + 7] == 116 && buf[offset + i + 8] == 97 &&
-                    buf[offset + i + 9] == 99 && buf[offset + i + 10] == 107)
-                {
-                    LastAttackTime = DateTime.UtcNow;
-                }
-            }
-
-            // Only parse the FIRST opcode. We cannot walk through sub-messages
-            // without a full protocol parser. Reading every byte as an opcode
-            // causes false 0x1D matches (~1/256 bytes) that flood the server
-            // with hundreds of spurious pingback packets per second.
+            // Parse only the first opcode (no full protocol parser).
             if (payload.Remaining > 0)
             {
                 byte op = payload.GetU8();
-                if (op == 0x14) // DISCONNECT MESSAGE
+                if (op == 0x14)
                 {
                     string reason = payload.GetString();
                     Console.WriteLine($"[Bot {_name}] Server rejected: {reason}");
                     return;
                 }
-                if (op == 0x1D) // PING
+                if (op == 0x1D)
                 {
                     var now = DateTime.UtcNow;
                     if ((now - _lastPingbackTime).TotalMilliseconds >= _config.PingbackMinIntervalMs)
@@ -382,7 +421,9 @@ namespace StressBotBenchmark
             await _writeLock.WaitAsync(token);
             try
             {
-                await _stream!.WriteAsync(packet, token);
+                var stream = _stream;
+                if (stream == null || !(_client?.Connected ?? false)) return;
+                await stream.WriteAsync(packet, token);
                 _metrics.IncSent();
                 _metrics.AddBytesOut(packet.Length);
             }

@@ -4,7 +4,7 @@ StressBotBenchmark is a .NET 8 console benchmark tool for spawning a large numbe
 
 The current implementation is tailored to a Tibia-like protocol stack and is tightly coupled to:
 
-- the Tibia 10.98 login/game protocol flow,
+- the Tibia 8.60 login/game protocol flow,
 - RSA and XTEA packet handling,
 - Tibia-specific opcodes for login, chat, spells, walking, attack, and ping responses,
 - an HTTP login API used before opening the game socket.
@@ -172,6 +172,6 @@ That would let you:
 
 ## Notes
 
-- The dashboard title still references `Tibia 10.98 StressBot Cluster`, which reflects the current protocol target.
+- The dashboard title still references `Tibia 8.60 StressBot Cluster`, which reflects the current protocol target.
 - Command-line argument parsing is minimal for now and only overrides bot count.
 - This repository currently focuses on benchmarking behavior, not clean abstraction across multiple engines.
