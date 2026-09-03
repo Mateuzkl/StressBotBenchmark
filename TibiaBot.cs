@@ -1,354 +1,320 @@
-using System;
-using System.IO;
-using System.Linq;
+using System.Diagnostics;
 using System.Net.Sockets;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Security.Cryptography;
 using StressBotBenchmark.Network;
 
 namespace StressBotBenchmark
 {
     public class TibiaBot : IDisposable
     {
-        private const int MaxPacketSize = 65535; // Tibia max packet
-        private const int ConnectTimeoutMs = 5000;
-
         private readonly string _name;
         private readonly string _password;
         private readonly BotConfig _config;
         private readonly BotMetrics _metrics;
+        private readonly ConnectionPacer _connectionPacer;
         private readonly uint[] _xteaKey = new uint[4];
+        private readonly CancellationTokenSource _stop = new();
+        private readonly SemaphoreSlim _writeLock = new(1, 1);
         private TcpClient? _client;
         private NetworkStream? _stream;
-        private CancellationTokenSource? _cts;
-        private readonly SemaphoreSlim _writeLock = new(1, 1);
-        private volatile bool _inWorld = false;
-        private volatile bool _disposed = false;
-        private DateTime _lastPingbackTime = DateTime.MinValue;
-        private int _reconnectAttempts = 0;
-        private string? _lastError = null;
-        private bool _permanentFailure = false;
+        private volatile bool _inWorld;
+        private volatile bool _connected;
+        private volatile bool _permanentFailure;
+        private volatile string? _lastError;
+        private int _started;
+        private int _disposed;
+        private long _lastSend;
+        private long _lastPing;
+        private bool _fightModesSent;
+        private readonly List<uint> _recentMonsters = new();
+        private readonly HashSet<uint> _allSeenMonsters = new();
+        private readonly object _monsterLock = new();
 
-        public TibiaBot(string name, string password, BotConfig config, BotMetrics metrics)
+        public TibiaBot(string name, string password, BotConfig config, BotMetrics metrics,
+                        ConnectionPacer connectionPacer)
         {
             _name = name;
             _password = password;
             _config = config;
             _metrics = metrics;
-            var rand = new Random();
-            for (int i = 0; i < 4; i++) _xteaKey[i] = (uint)rand.Next();
+            _connectionPacer = connectionPacer;
         }
-
 
         public string Name => _name;
         public bool InWorld => _inWorld;
-
+        public bool Connected => _connected;
+        public string? LastError => _lastError;
+        public bool PermanentFailure => _permanentFailure;
         public DateTime LastWalkTime { get; private set; } = DateTime.MinValue;
         public DateTime LastSpellTime { get; private set; } = DateTime.MinValue;
         public DateTime LastAttackTime { get; private set; } = DateTime.MinValue;
         public DateTime LastDamageTakenTime { get; private set; } = DateTime.MinValue;
-        public string? LastError => _lastError;
-        public bool PermanentFailure => _permanentFailure;
+        public int TrackedMonstersTotal { get { lock (_monsterLock) return _allSeenMonsters.Count; } }
 
-        public int TrackedMonstersTotal => _allSeenMonsters.Count;
-
-        private bool _running = false;
-
-        public async Task StartAsync()
+        public async Task StartAsync(CancellationToken cancellationToken = default)
         {
-            _running = true;
-            var rand = new Random();
-            while (_running && !_disposed)
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            if (Interlocked.Exchange(ref _started, 1) != 0)
+                throw new InvalidOperationException("This bot has already been started.");
+            using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _stop.Token);
+            var token = lifetime.Token;
+            int failures = 0;
+            bool retry = false;
+            try
             {
-                _cts = new CancellationTokenSource();
-                try
+                while (!token.IsCancellationRequested)
                 {
-                    await ConnectAndRunAsync(_cts.Token);
-                    _reconnectAttempts = 0;
-                }
-                catch (OperationCanceledException) { }
-                catch (Exception e)
-                {
-                    // Se _lastError já contém erro do servidor (ex: auth fail via encrypted packet),
-                    // usar ele. Senão usar e.Message (erro de conexão/stream).
-                    string errorMsg = _lastError ?? e.Message;
-                    _lastError = errorMsg;
-
-                    // Erros permanentes: não adianta reconectar
-                    if (IsPermanentError(errorMsg))
+                    int retryDelayMs = 0;
+                    try
                     {
-                        _permanentFailure = true;
-                        _metrics.IncDisconnects();
-                        break;
+                        await _connectionPacer.WaitAsync(token);
+                        if (retry) _metrics.IncReconnects();
+                        _lastError = null;
+                        using var session = CancellationTokenSource.CreateLinkedTokenSource(token);
+                        await ConnectAndRunAsync(session, token);
                     }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
+                    catch (Exception error)
+                    {
+                        bool wasInWorld = _inWorld;
+                        _lastError = error is OperationCanceledException
+                            ? "Timeout while connecting or waiting for the login response."
+                            : error.Message;
+                        if (_connected) _metrics.IncDisconnects();
+                        else _metrics.IncConnectionFailures();
+                        _metrics.RecordError(_name, _lastError);
+                        _permanentFailure = IsPermanentError(_lastError);
+                        if (!_config.Reconnect || _permanentFailure) break;
+                        failures = wasInWorld ? 1 : Math.Min(failures + 1, 5);
+                        retryDelayMs = Math.Min(2000 * (1 << (failures - 1)), 30000);
+                        if (error is LoginWaitException waiting)
+                            retryDelayMs = Math.Max(retryDelayMs, waiting.RetrySeconds * 1000);
+                        retryDelayMs += Random.Shared.Next(500, 1500);
+                        retry = true;
+                    }
+                    finally { CleanupConnection(); }
 
-                    if (!_config.Reconnect) break;
-                    _metrics.IncDisconnects();
-                    _metrics.IncReconnects();
-                    _reconnectAttempts++;
-                    int backoffMs = Math.Min(2000 * (1 << Math.Min(_reconnectAttempts - 1, 4)), 30000);
-                    int jitter = rand.Next(0, backoffMs / 2);
-                    try { await Task.Delay(backoffMs + jitter); } catch { }
+                    if (retryDelayMs > 0)
+                        await Task.Delay(retryDelayMs, token);
+                    else break;
                 }
-                finally
-                {
-                    CleanupConnection();
-                }
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+            finally
+            {
+                CleanupConnection();
+                // Run owns these resources; no writer survives ConnectAndRunAsync.
+                _writeLock.Dispose();
+                _stop.Dispose();
             }
         }
 
-        private static bool IsPermanentError(string message)
-        {
-            // Erros que o servidor envia e que nunca vão mudar com retry
-            return message.Contains("password is not correct", StringComparison.OrdinalIgnoreCase)
-                || message.Contains("account name or password", StringComparison.OrdinalIgnoreCase)
-                || message.Contains("account has been banned", StringComparison.OrdinalIgnoreCase)
-                || message.Contains("character is not", StringComparison.OrdinalIgnoreCase)
-                || message.Contains("does not exist", StringComparison.OrdinalIgnoreCase);
-        }
+        private static bool IsPermanentError(string message) =>
+            message.Contains("password is not correct", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("account name or password", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("account has been banned", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("character is not", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("does not exist", StringComparison.OrdinalIgnoreCase);
 
         public void Stop()
         {
-            _running = false;
-            _cts?.Cancel();
-            CleanupConnection();
+            try { _stop.Cancel(); } catch (ObjectDisposedException) { }
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            Stop();
+            if (Volatile.Read(ref _started) == 0)
+            {
+                _writeLock.Dispose();
+                _stop.Dispose();
+            }
         }
 
         private void CleanupConnection()
         {
             _inWorld = false;
-            try { _stream?.Dispose(); } catch { }
-            try { _client?.Dispose(); } catch { }
+            if (_connected)
+            {
+                _connected = false;
+                _metrics.Disconnected();
+            }
+            _stream?.Dispose();
+            _client?.Dispose();
             _stream = null;
             _client = null;
-        }
-
-        public void Dispose()
-        {
-            if (_disposed) return;
-            _disposed = true;
-            Stop();
-            _cts?.Dispose();
-            _writeLock.Dispose();
-        }
-
-        private async Task ConnectAndRunAsync(CancellationToken token)
-        {
-            _lastError = null; // Reset antes de cada tentativa
-
-            _client = new TcpClient
+            _fightModesSent = false;
+            lock (_monsterLock)
             {
-                NoDelay = true,
-                SendTimeout = 5000,
-                ReceiveTimeout = 30000
-            };
+                _recentMonsters.Clear();
+                _allSeenMonsters.Clear();
+            }
+        }
 
-            using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(token);
-            connectCts.CancelAfter(ConnectTimeoutMs);
-            await _client.ConnectAsync(_config.Host, _config.Port, connectCts.Token);
+        private async Task ConnectAndRunAsync(CancellationTokenSource session, CancellationToken shutdownToken)
+        {
+            var token = session.Token;
+            _client = new TcpClient { NoDelay = true };
+            using (var connect = CancellationTokenSource.CreateLinkedTokenSource(token))
+            {
+                connect.CancelAfter(TimeSpan.FromSeconds(5));
+                await _client.ConnectAsync(_config.Host, _config.Port, connect.Token);
+            }
             _stream = _client.GetStream();
-            _inWorld = false;
+            _connected = true;
+            _metrics.Connected();
+            _lastSend = _lastPing = 0;
+            byte[] keyBytes = RandomNumberGenerator.GetBytes(16);
+            for (int i = 0; i < 4; i++)
+                _xteaKey[i] = BitConverter.ToUInt32(keyBytes, i * 4);
 
-            byte[] challengeMsg;
+            using (var handshake = CancellationTokenSource.CreateLinkedTokenSource(token))
+            {
+                handshake.CancelAfter(TimeSpan.FromSeconds(30));
+                byte[] challenge = await ReadMessageAsync(handshake.Token);
+                if (challenge.Length != 12 ||
+                    BitConverter.ToUInt32(challenge, 0) != Adler32(challenge.AsSpan(4)) ||
+                    BitConverter.ToUInt16(challenge, 4) != 6 || challenge[6] != 0x1F)
+                    throw new InvalidDataException("Invalid TFS 8.60 challenge.");
+
+                await SendLoginMessageAsync(BitConverter.ToUInt32(challenge, 7), challenge[11], handshake.Token);
+                // Do not discard the first packet: it contains the 0x0A login acknowledgement.
+                while (!_inWorld)
+                    await ProcessEncryptedPacketAsync(await ReadMessageAsync(handshake.Token), handshake.Token);
+            }
+
+            var tasks = new List<Task> { ReadLoopAsync(token), KeepAliveLoopAsync(token), IdleTurnLoopAsync(token) };
+            if (!_config.LoginOnly)
+            {
+                tasks.Add(WalkLoopAsync(token));
+                tasks.Add(ChatLoopAsync(token));
+                tasks.Add(SpellLoopAsync(token));
+                tasks.Add(AttackLoopAsync(token));
+            }
             try
             {
-                challengeMsg = await ReadMessageAsync(token);
+                await await Task.WhenAny(tasks);
             }
-            catch (EndOfStreamException)
+            finally
             {
-                throw new Exception("Server closed connection before sending challenge (connection limit? server not running?)");
+                session.Cancel();
+                // All old read/write/action loops finish before the next socket and key exist.
+                try { await Task.WhenAll(tasks); } catch (Exception) { }
+                if (shutdownToken.IsCancellationRequested && _inWorld)
+                    await TryLogoutAsync();
             }
+        }
 
-            if (challengeMsg.Length < 12 || challengeMsg[6] != 0x1F)
-            {
-                // Maybe server sent a disconnect message (unencrypted 0x14)
-                if (challengeMsg.Length >= 4 && challengeMsg[0] == 0x14)
-                {
-                    var errMsg = new InputMessage(challengeMsg, 1, challengeMsg.Length);
-                    throw new Exception($"Server rejected (pre-login): {errMsg.GetString()}");
-                }
-                string hex = BitConverter.ToString(challengeMsg, 0, Math.Min(challengeMsg.Length, 20));
-                throw new Exception($"Invalid challenge (len={challengeMsg.Length}, hex={hex})");
-            }
-            
-            uint ts = BitConverter.ToUInt32(challengeMsg, 7);
-            byte rand = challengeMsg[11];
-
-            await SendLoginMessageAsync(ts, rand, token);
-
-            // Read first response - could be encrypted game data or disconnect
-            byte[] firstResponse;
+        private async Task TryLogoutAsync()
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
             try
             {
-                firstResponse = await ReadMessageAsync(token);
+                var message = new OutputMessage();
+                message.AddU8(0x14);
+                await SendRawGameMessageAsync(message, timeout.Token);
             }
-            catch (EndOfStreamException)
-            {
-                throw new Exception("Server closed connection after login (RSA decrypt failed? wrong protocol version?)");
-            }
-
-            // Try to parse first response - check for unencrypted disconnect (0x14)
-            if (firstResponse.Length >= 4 && firstResponse[0] == 0x14)
-            {
-                var errMsg = new InputMessage(firstResponse, 1, firstResponse.Length);
-                throw new Exception($"Server rejected: {errMsg.GetString()}");
-            }
-
-            // Process first encrypted response normally
-            ProcessEncryptedPacket(firstResponse);
-
-            var readTask = ReadLoopAsync(token);
-
-            if (_config.LoginOnly)
-            {
-                // Login-only mode: just maintain connection and respond to pings
-                await readTask;
-            }
-            else
-            {
-                var walkTask = WalkLoopAsync(token);
-                var chatTask = ChatLoopAsync(token);
-                var spellTask = SpellLoopAsync(token);
-                var attackTask = AttackLoopAsync(token);
-
-                Task completedTask = await Task.WhenAny(readTask, walkTask, chatTask, spellTask, attackTask);
-                _cts?.Cancel();
-                await completedTask;
-            }
+            catch (Exception) { /* The socket may already be closed. */ }
         }
 
-        private void ProcessEncryptedPacket(byte[] body)
+        private async Task SendLoginMessageAsync(uint timestamp, byte random, CancellationToken token)
         {
-            if (body.Length < 6) return;
-            byte[] encrypted = new byte[body.Length - 4];
-            Array.Copy(body, 4, encrypted, 0, encrypted.Length);
-            if (encrypted.Length % 8 != 0) return;
-            Xtea.Decrypt(encrypted, _xteaKey);
+            var rsa = new OutputMessage();
+            rsa.AddU8(0);
+            foreach (uint key in _xteaKey) rsa.AddU32(key);
+            rsa.AddU8(0);
+            rsa.AddString(_name);
+            rsa.AddString(_name);
+            rsa.AddString(_password);
+            rsa.AddU32(timestamp);
+            rsa.AddU8(random);
+            byte[] raw = rsa.GetBuffer();
+            if (raw.Length > 128)
+                throw new InvalidDataException("Account name and password exceed the RSA login block.");
+            byte[] padded = new byte[128];
+            raw.CopyTo(padded, 0);
 
-            var msg = new InputMessage(encrypted);
-            ushort innerLen = msg.GetU16();
-            int end = Math.Min(msg.Position + innerLen, encrypted.Length);
-            var payload = new InputMessage(encrypted, msg.Position, end);
-
-            // Check for disconnect opcode
-            if (payload.Remaining > 0)
-            {
-                int savedPos = payload.Position;
-                byte op = payload.GetU8();
-                if (op == 0x14)
-                {
-                    string reason = payload.GetString();
-                    _lastError = reason;
-                }
-            }
+            var message = new OutputMessage();
+            message.AddU8(0x0A);
+            message.AddU16(2); // Windows/CIP: no custom-client ping sequence or extensions.
+            message.AddU16(860);
+            message.AddBytes(Rsa.Encrypt(padded));
+            await WritePacketAsync(WrapChecksum(message.GetBuffer()), token);
         }
-
-        private async Task SendLoginMessageAsync(uint ts, byte rand, CancellationToken token)
-        {
-            // Protocolo Tibia 8.60 / TFS 1.8
-            var rsaBytes = new OutputMessage();
-            rsaBytes.AddU8(0);                                    // RSA check byte
-            for (int i = 0; i < 4; i++) rsaBytes.AddU32(_xteaKey[i]); // XTEA key
-            rsaBytes.AddU8(0);                                    // gamemaster flag (0 = jogador normal)
-            rsaBytes.AddString(_name);                            // account name
-            rsaBytes.AddString(_name);                            // character name (igual ao account)
-            rsaBytes.AddString(_password);                        // password
-            rsaBytes.AddU32(ts);                                  // challenge timestamp
-            rsaBytes.AddU8(rand);                                 // challenge random
-
-            byte[] rawRsa = rsaBytes.GetBuffer();
-            byte[] paddedRsa = new byte[128];
-            Array.Copy(rawRsa, paddedRsa, rawRsa.Length);
-            byte[] encryptedRsa = Rsa.Encrypt(paddedRsa);
-
-            var msg = new OutputMessage();
-            msg.AddU16(2);    // OS: 2 = Windows
-            msg.AddU16(860);  // Protocol version 8.60
-            msg.AddBytes(encryptedRsa);
-
-            var payload = msg.GetBuffer();
-            byte[] final = new byte[payload.Length + 3];
-            final[0] = (byte)((payload.Length + 1) & 0xFF);
-            final[1] = (byte)(((payload.Length + 1) >> 8) & 0xFF);
-            final[2] = 0x0A; // Game protocol ID
-            Array.Copy(payload, 0, final, 3, payload.Length);
-            
-            _metrics.AddBytesOut(final.Length);
-            _metrics.IncSent();
-
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            await _stream!.WriteAsync(final, token);
-            sw.Stop();
-            _metrics.AddDrainMs(sw.Elapsed.TotalMilliseconds);
-        }
-
-
 
         private async Task<byte[]> ReadMessageAsync(CancellationToken token)
         {
-            var stream = _stream ?? throw new InvalidOperationException("Stream closed");
-            byte[] sizeHeader = new byte[2];
-            int read = 0;
-            while (read < 2)
-            {
-                int r = await stream.ReadAsync(sizeHeader, read, 2 - read, token);
-                if (r == 0) throw new EndOfStreamException();
-                read += r;
-            }
-            int size = sizeHeader[0] | (sizeHeader[1] << 8);
-            if (size <= 0 || size > MaxPacketSize)
-                throw new InvalidDataException($"Invalid packet size: {size}");
-
+            var stream = _stream ?? throw new IOException("Stream is closed.");
+            byte[] header = new byte[2];
+            try { await stream.ReadExactlyAsync(header, token); }
+            catch (EndOfStreamException) { throw new IOException("Server closed the connection."); }
+            int size = BitConverter.ToUInt16(header);
+            if (size < 5) throw new InvalidDataException($"Invalid packet size: {size}.");
             byte[] body = new byte[size];
-            read = 0;
-            while (read < size)
-            {
-                int r = await stream.ReadAsync(body, read, size - read, token);
-                if (r == 0) throw new EndOfStreamException();
-                read += r;
-            }
+            await stream.ReadExactlyAsync(body, token);
             _metrics.IncPacketsIn();
-            _metrics.AddBytesIn((long)size + 2);
+            _metrics.AddBytesIn(size + 2);
             return body;
         }
 
         private async Task ReadLoopAsync(CancellationToken token)
         {
             while (!token.IsCancellationRequested)
-            {
-                byte[] body = await ReadMessageAsync(token);
-                if (body.Length < 6) continue;
-                
-                byte[] encrypted = new byte[body.Length - 4];
-                Array.Copy(body, 4, encrypted, 0, encrypted.Length);
-                
-                if (encrypted.Length % 8 != 0) continue;
-                Xtea.Decrypt(encrypted, _xteaKey);
-                
-                var msg = new InputMessage(encrypted);
-                ushort innerLen = msg.GetU16();
-                int end = Math.Min(msg.Position + innerLen, encrypted.Length);
-                var payload = new InputMessage(encrypted, msg.Position, end);
-                
-                await ProcessPayloadAsync(payload, token);
-            }
+                await ProcessEncryptedPacketAsync(await ReadMessageAsync(token), token);
         }
 
-        private bool _fightModesSent = false;
-        private readonly List<uint> _recentMonsters = new();
-        private readonly HashSet<uint> _allSeenMonsters = new();
-        private readonly object _monsterLock = new();
+        private async Task ProcessEncryptedPacketAsync(byte[] body, CancellationToken token)
+        {
+            if (body.Length < 12 || (body.Length - 4) % 8 != 0 ||
+                BitConverter.ToUInt32(body, 0) != Adler32(body.AsSpan(4)))
+                throw new InvalidDataException("Invalid encrypted packet length or Adler32 checksum.");
+            byte[] encrypted = body.AsSpan(4).ToArray();
+            Xtea.Decrypt(encrypted, _xteaKey);
+            int length = BitConverter.ToUInt16(encrypted);
+            if (length < 1 || length > encrypted.Length - 2)
+                throw new InvalidDataException("Invalid XTEA payload length.");
+            await ProcessPayloadAsync(new InputMessage(encrypted, 2, length + 2), token);
+        }
 
         private async Task ProcessPayloadAsync(InputMessage payload, CancellationToken token)
         {
-            if (!_inWorld)
+            if (!_config.LoginOnly && _inWorld) TrackLegacyCombat(payload);
+            // Read only opcodes whose complete layout is known. Never scan arbitrary
+            // map/item bytes for ping or login markers.
+            while (payload.Remaining > 0)
             {
-                _inWorld = true;
-                _fightModesSent = false;
+                byte opcode = payload.GetU8();
+                switch (opcode)
+                {
+                    case 0x0A:
+                        if (payload.Remaining < 7)
+                            throw new InvalidDataException("Truncated login acknowledgement.");
+                        uint playerId = payload.GetU32();
+                        if (playerId == 0) throw new InvalidDataException("Invalid player ID.");
+                        payload.Skip(3); // beat duration + can-report-bugs
+                        _inWorld = true;
+                        continue;
+                    case 0x14:
+                        throw new IOException(payload.GetString());
+                    case 0x16:
+                        string reason = payload.GetString();
+                        throw new LoginWaitException(reason, payload.GetU8());
+                    case 0x1E:
+                    case 0x1D:
+                        await SendPingBackAsync(token);
+                        continue;
+                    default:
+                        // Full map/combat parsing remains separate from connection
+                        // liveness. Periodic 0x1E works even with a bundled ping.
+                        return;
+                }
             }
+        }
 
-            // Only run heuristic scanners when their features are actually enabled.
-            // This avoids wasting CPU scanning every packet when attack/engagement is off.
+        // Retained for existing combat profiles; this is not a full creature parser.
+        private void TrackLegacyCombat(InputMessage payload)
+        {
             if (_config.EnableAttack)
             {
                 int length = payload.Remaining;
@@ -391,86 +357,102 @@ namespace StressBotBenchmark
                     }
                 }
             }
+        }
 
-            // Parse only the first opcode (no full protocol parser).
-            if (payload.Remaining > 0)
+        private async Task KeepAliveLoopAsync(CancellationToken token)
+        {
+            await Task.Delay(Random.Shared.Next(200, 1000), token);
+            while (!token.IsCancellationRequested)
             {
-                byte op = payload.GetU8();
-                if (op == 0x14)
-                {
-                    string reason = payload.GetString();
-                    _lastError = reason;
-                    return;
-                }
-                if (op == 0x1D)
-                {
-                    var now = DateTime.UtcNow;
-                    if ((now - _lastPingbackTime).TotalMilliseconds >= _config.PingbackMinIntervalMs)
-                    {
-                        _lastPingbackTime = now;
-                        await SendPingBackAsync(token);
-                    }
-                }
+                if (_inWorld) await SendPingBackAsync(token);
+                await Task.Delay(TimeSpan.FromMilliseconds(_config.KeepAliveIntervalMs), token);
+            }
+        }
+
+        private async Task IdleTurnLoopAsync(CancellationToken token)
+        {
+            if (_config.IdleTurnIntervalMs <= 0) { await Task.Delay(Timeout.Infinite, token); return; }
+            while (!token.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(
+                    _config.IdleTurnIntervalMs * (0.9 + Random.Shared.NextDouble() * 0.2)), token);
+                if (!_inWorld) continue;
+                var message = new OutputMessage();
+                message.AddU8((byte)(0x6F + Random.Shared.Next(4)));
+                await SendRawGameMessageAsync(message, token);
+                _metrics.IncTurns();
             }
         }
 
         private async Task SendPingBackAsync(CancellationToken token)
         {
-            var msg = new OutputMessage();
-            msg.AddU8(0x1E); // PINGBACK
-            await SendRawGameMessageAsync(msg, token);
-            _metrics.IncPingbacks();
+            var message = new OutputMessage();
+            message.AddU8(0x1E);
+            await SendRawGameMessageAsync(message, token, isPing: true);
         }
 
-        private async Task SendRawGameMessageAsync(OutputMessage msg, CancellationToken token)
+        private async Task SendRawGameMessageAsync(OutputMessage message, CancellationToken token, bool isPing = false)
         {
-            byte[] inner = msg.GetBuffer();
-            var innerWrapper = new OutputMessage();
-            innerWrapper.AddU16((ushort)inner.Length);
-            innerWrapper.AddBytes(inner);
-            byte[] toEncrypt = innerWrapper.GetBuffer();
-
-            int pad = (8 - toEncrypt.Length % 8) % 8;
-            byte[] padded = new byte[toEncrypt.Length + pad];
-            Array.Copy(toEncrypt, padded, toEncrypt.Length);
+            var payload = message.GetBuffer();
+            byte[] padded = new byte[(payload.Length + 2 + 7) / 8 * 8];
+            BitConverter.TryWriteBytes(padded.AsSpan(), (ushort)payload.Length);
+            payload.CopyTo(padded, 2);
             Xtea.Encrypt(padded, _xteaKey);
+            await WritePacketAsync(WrapChecksum(padded), token, isPing);
+        }
 
-            byte[] packet = new byte[padded.Length + 6];
-            packet[0] = (byte)((padded.Length + 4) & 0xFF);
-            packet[1] = (byte)(((padded.Length + 4) >> 8) & 0xFF);
-            
-            uint checksum = Adler32(padded);
-            packet[2] = (byte)(checksum & 0xFF);
-            packet[3] = (byte)((checksum >> 8) & 0xFF);
-            packet[4] = (byte)((checksum >> 16) & 0xFF);
-            packet[5] = (byte)((checksum >> 24) & 0xFF);
-            
-            Array.Copy(padded, 0, packet, 6, padded.Length);
-
+        private async Task WritePacketAsync(byte[] packet, CancellationToken token, bool isPing = false)
+        {
+            long queued = Stopwatch.GetTimestamp();
             await _writeLock.WaitAsync(token);
             try
             {
-                var stream = _stream;
-                if (stream == null || !(_client?.Connected ?? false)) return;
-                await stream.WriteAsync(packet, token);
+                if (isPing && _lastPing != 0 && Stopwatch.GetElapsedTime(_lastPing).TotalMilliseconds < 1000)
+                    return;
+                // Bound all writes, including heartbeats and actions, below TFS's 25 pps.
+                if (_lastSend != 0)
+                {
+                    double remaining = 55 - Stopwatch.GetElapsedTime(_lastSend).TotalMilliseconds;
+                    if (remaining > 0) await Task.Delay(TimeSpan.FromMilliseconds(remaining), token);
+                }
+                _metrics.AddQueueWaitMs(Stopwatch.GetElapsedTime(queued).TotalMilliseconds);
+                var stream = _stream ?? throw new IOException("Stream is closed.");
+                long started = Stopwatch.GetTimestamp();
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+                timeout.CancelAfter(TimeSpan.FromSeconds(5));
+                await stream.WriteAsync(packet, timeout.Token);
+                _lastSend = Stopwatch.GetTimestamp();
+                _metrics.AddDrainMs(Stopwatch.GetElapsedTime(started).TotalMilliseconds);
                 _metrics.IncSent();
                 _metrics.AddBytesOut(packet.Length);
+                if (isPing)
+                {
+                    _lastPing = _lastSend;
+                    _metrics.IncPingbacks();
+                }
             }
-            finally
-            {
-                _writeLock.Release();
-            }
+            finally { _writeLock.Release(); }
         }
 
-        private uint Adler32(byte[] data)
+        private static byte[] WrapChecksum(byte[] payload)
+        {
+            var result = new byte[payload.Length + 6];
+            BitConverter.TryWriteBytes(result.AsSpan(), (ushort)(payload.Length + 4));
+            BitConverter.TryWriteBytes(result.AsSpan(2), Adler32(payload));
+            payload.CopyTo(result, 6);
+            return result;
+        }
+
+        private static uint Adler32(ReadOnlySpan<byte> data)
         {
             uint a = 1, b = 0;
-            foreach (byte val in data)
-            {
-                a = (a + val) % 65521;
-                b = (b + a) % 65521;
-            }
+            foreach (byte value in data) { a = (a + value) % 65521; b = (b + a) % 65521; }
             return (b << 16) | a;
+        }
+
+        private sealed class LoginWaitException(string message, byte retrySeconds) : IOException(message)
+        {
+            public int RetrySeconds { get; } = retrySeconds;
         }
 
         private async Task WalkLoopAsync(CancellationToken token)

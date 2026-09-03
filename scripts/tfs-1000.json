@@ -1,0 +1,20 @@
+{
+  "host": "127.0.0.1",
+  "port": 7172,
+  "botCount": 1000,
+  "prefix": "test",
+  "password": "test123",
+  "accountWidth": 3,
+  "loginDelayMs": 650,
+  "burstSize": 1,
+  "burstPauseMs": 0,
+  "loginOnly": true,
+  "reconnect": true,
+  "enableRandomWalk": false,
+  "enableChat": false,
+  "enableSpell": false,
+  "enableAttack": false,
+  "keepAliveIntervalMs": 5000,
+  "idleTurnIntervalMs": 60000,
+  "dashboardIntervalMs": 1000
+}

@@ -4,7 +4,19 @@ namespace StressBotBenchmark
 {
     public class BotMetrics
     {
-        public int ConnectedCount => 1; // Evaluated dynamically usually
+        private int _connected;
+        private int _connectionFailures;
+        private int _turns;
+        private string? _lastError;
+        public int ConnectedCount => Volatile.Read(ref _connected);
+        public int ConnectionFailures => Volatile.Read(ref _connectionFailures);
+        public int Turns => Volatile.Read(ref _turns);
+        public string? LastError => Volatile.Read(ref _lastError);
+        public void Connected() => Interlocked.Increment(ref _connected);
+        public void Disconnected() => Interlocked.Decrement(ref _connected);
+        public void IncConnectionFailures() => Interlocked.Increment(ref _connectionFailures);
+        public void IncTurns() => Interlocked.Increment(ref _turns);
+        public void RecordError(string bot, string error) => Volatile.Write(ref _lastError, $"{bot}: {error}");
         
         private int _enqueued;
         private int _sent;
@@ -25,6 +37,8 @@ namespace StressBotBenchmark
         private int _drainSamples;
         private double _maxSendLagMs;
         private readonly object _lagLock = new object();
+        private double _queueWaitMsSum;
+        private long _queueWaitSamples;
         
         public int Enqueued => _enqueued;
         public int Sent => _sent;
@@ -41,8 +55,13 @@ namespace StressBotBenchmark
         public long BytesIn => _bytesIn;
         public long BytesOut => _bytesOut;
 
-        public double AvgDrainMs => _drainSamples > 0 ? _drainMsSum / _drainSamples : 0;
-        public double MaxSendLagMs => _maxSendLagMs;
+        public double AvgDrainMs { get { lock (_lagLock) return _drainSamples > 0 ? _drainMsSum / _drainSamples : 0; } }
+        public double MaxSendLagMs { get { lock (_lagLock) return _maxSendLagMs; } }
+        public double AvgQueueWaitMs { get { lock (_lagLock) return _queueWaitSamples > 0 ? _queueWaitMsSum / _queueWaitSamples : 0; } }
+        public void AddQueueWaitMs(double ms)
+        {
+            lock (_lagLock) { _queueWaitMsSum += ms; _queueWaitSamples++; }
+        }
 
         public void IncEnqueued() => Interlocked.Increment(ref _enqueued);
         public void IncSent() => Interlocked.Increment(ref _sent);
@@ -61,14 +80,10 @@ namespace StressBotBenchmark
 
         public void AddDrainMs(double ms)
         {
-            double oldSum, newSum;
-            do { oldSum = _drainMsSum; newSum = oldSum + ms; } 
-            while (Interlocked.CompareExchange(ref _drainMsSum, newSum, oldSum) != oldSum);
-            
-            Interlocked.Increment(ref _drainSamples);
-
             lock (_lagLock)
             {
+                _drainMsSum += ms;
+                _drainSamples++;
                 if (ms > _maxSendLagMs) _maxSendLagMs = ms;
             }
         }

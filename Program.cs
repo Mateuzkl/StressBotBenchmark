@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Diagnostics;
+using System.Globalization;
 using Spectre.Console;
 
 namespace StressBotBenchmark
@@ -33,16 +35,86 @@ namespace StressBotBenchmark
                 config = RunInteractiveMenu();
             }
 
-            var metrics = new BotMetrics();
-            var bots = new List<TibiaBot>();
+            await RunBenchmarkAsync(config, args);
+        }
 
-            AnsiConsole.MarkupLine($"\n[bold]Launching {config.BotCount} bots to {config.Host}:{config.Port}...[/]");
+        static async Task RunBenchmarkAsync(BotConfig config, string[] args)
+        {
+            double durationSeconds = 0;
+            try
+            {
+                foreach (string arg in args)
+                {
+                    if (arg.StartsWith("--bots=")) config.BotCount = int.Parse(arg[7..], CultureInfo.InvariantCulture);
+                    else if (arg == "--login-only") config.LoginOnly = true;
+                    else if (arg.StartsWith("--duration="))
+                    {
+                        string value = arg[11..];
+                        double multiplier = value.EndsWith('m') ? 60 : value.EndsWith('h') ? 3600 : 1;
+                        if (value.EndsWith('s') || value.EndsWith('m') || value.EndsWith('h')) value = value[..^1];
+                        durationSeconds = double.Parse(value, CultureInfo.InvariantCulture) * multiplier;
+                    }
+                }
+                if (config.BotCount < 1 || config.BotCount > 1000 || config.AccountWidth < 1 || config.AccountWidth > 12 ||
+                    string.IsNullOrWhiteSpace(config.Host) || string.IsNullOrWhiteSpace(config.Prefix) ||
+                    config.Port < 1 || config.Port > 65535 ||
+                    !double.IsFinite(config.LoginDelayMs) || config.LoginDelayMs < 0 || config.LoginDelayMs > 60000 ||
+                    !double.IsFinite(config.KeepAliveIntervalMs) || config.KeepAliveIntervalMs < 1000 || config.KeepAliveIntervalMs > 5000 ||
+                    !double.IsFinite(config.IdleTurnIntervalMs) || config.IdleTurnIntervalMs < 0 || config.IdleTurnIntervalMs > 600000 ||
+                    !double.IsFinite(config.DashboardIntervalMs) || config.DashboardIntervalMs < 100 || config.DashboardIntervalMs > 60000 ||
+                    !double.IsFinite(durationSeconds) || durationSeconds < 0 || durationSeconds > 86400 * 7)
+                    throw new ArgumentException("Configuração inválida: bots 1–1000, ping 1000–5000 ms e intervalos válidos são necessários.");
+            }
+            catch (Exception error) when (error is ArgumentException or FormatException or OverflowException)
+            {
+                AnsiConsole.MarkupLine($"[red]{Markup.Escape(error.Message)}[/]");
+                Environment.ExitCode = 2;
+                return;
+            }
+
+            // Old saved scripts may still request 100 ms bursts. Apply the same
+            // minimum to every TCP attempt, including all retries.
+            config.LoginDelayMs = Math.Max(650, config.LoginDelayMs);
+            if (config.LoginOnly)
+            {
+                config.EnableAttack = config.EnableRandomWalk = config.EnableChat = config.EnableSpell = false;
+            }
             ShowConfigSummary(config);
+            AnsiConsole.MarkupLine($"[grey]Intervalo global: {config.LoginDelayMs:F0} ms. Subida mínima: {(config.BotCount - 1) * config.LoginDelayMs / 60000:F1} min. Ctrl+C encerra.[/]");
+            if (args.Contains("--check-config")) return;
 
-            var burstTask = LaunchBotsAsync(config, metrics, bots);
-            var dashTask = DashboardLoopAsync(config, metrics, bots);
-
-            await Task.WhenAll(burstTask, dashTask);
+            var metrics = new BotMetrics();
+            using var stop = new CancellationTokenSource();
+            if (durationSeconds > 0) stop.CancelAfter(TimeSpan.FromSeconds(durationSeconds));
+            using var pacer = new ConnectionPacer(config.LoginDelayMs);
+            // Build the collection before starting tasks so the dashboard sees a
+            // stable array, while each connection exposes its current state.
+            var bots = Enumerable.Range(1, config.BotCount)
+                .Select(i => new TibiaBot($"{config.Prefix}_{i.ToString($"D{config.AccountWidth}")}",
+                    config.Password, config, metrics, pacer)).ToArray();
+            ConsoleCancelEventHandler cancel = (_, eventArgs) => { eventArgs.Cancel = true; stop.Cancel(); };
+            Console.CancelKeyPress += cancel;
+            var elapsed = Stopwatch.StartNew();
+            var runs = bots.Select(bot => bot.StartAsync(stop.Token)).ToArray();
+            var allBots = Task.WhenAll(runs);
+            var dashboard = DashboardLoopAsync(config, metrics, bots, stop.Token);
+            try
+            {
+                await Task.WhenAny(allBots, dashboard);
+            }
+            finally
+            {
+                stop.Cancel();
+                foreach (var bot in bots) bot.Stop();
+                try { await allBots; }
+                finally
+                {
+                    try { await dashboard; } catch (OperationCanceledException) { }
+                    foreach (var bot in bots) bot.Dispose();
+                    Console.CancelKeyPress -= cancel;
+                }
+            }
+            AnsiConsole.MarkupLine($"[bold]Encerrado após {elapsed.Elapsed.TotalSeconds:F1}s. Disconnects: {metrics.Disconnects}; falhas TCP: {metrics.ConnectionFailures}; pings: {metrics.Pingbacks}.[/]");
         }
 
         // ════════════════════════════════════════════════════════
@@ -113,7 +185,7 @@ namespace StressBotBenchmark
 
             // LoginOnly só se nenhuma ação foi selecionada, ou se explicitamente escolheu idle
             bool anyAction = config.EnableAttack || config.EnableRandomWalk || config.EnableChat || config.EnableSpell;
-            config.LoginOnly = behaviors.Contains("Login-only (idle)") && !anyAction;
+            config.LoginOnly = behaviors.Contains("Login-only (idle)") || !anyAction;
 
             if (config.EnableAttack)
             {
@@ -230,15 +302,15 @@ namespace StressBotBenchmark
 
             table.AddRow("Vocação", $"[bold]{vp.Vocation}[/]");
             table.AddRow("Bots", $"{c.BotCount}");
+            table.AddRow("Contas", Markup.Escape($"{c.Prefix}_{1.ToString($"D{c.AccountWidth}")} ... {c.Prefix}_{c.BotCount.ToString($"D{c.AccountWidth}")}"));
+            table.AddRow("Ping / virar", $"{c.KeepAliveIntervalMs:F0} ms / {c.IdleTurnIntervalMs:F0} ms");
             table.AddRow("Login-Only", c.LoginOnly ? "[yellow]Sim[/]" : "Não");
             table.AddRow("Atacar", c.EnableAttack ? "[green]Sim[/]" : "[grey]Não[/]");
             table.AddRow("Andar", c.EnableRandomWalk ? "[green]Sim[/]" : "[grey]Não[/]");
             table.AddRow("Spells", c.EnableSpell ? "[green]Sim[/]" : "[grey]Não[/]");
 
-            if (vp.Heal1.Enabled) table.AddRow("Heal 1", $"{vp.Heal1.SpellText} @ HP<={vp.Heal1.ThresholdPercent}%");
-            if (vp.Heal2.Enabled) table.AddRow("Heal 2", $"{vp.Heal2.SpellText} @ HP<={vp.Heal2.ThresholdPercent}%");
-            if (vp.Spell1.Enabled) table.AddRow("Atk Spell 1", $"{vp.Spell1.SpellText} cada {vp.Spell1.IntervalMs}ms");
-            if (vp.Spell2.Enabled) table.AddRow("Atk Spell 2", $"{vp.Spell2.SpellText} cada {vp.Spell2.IntervalMs}ms");
+            if (!c.LoginOnly && vp.Spell1.Enabled) table.AddRow("Atk Spell 1", Markup.Escape($"{vp.Spell1.SpellText} cada {vp.Spell1.IntervalMs}ms"));
+            if (!c.LoginOnly && vp.Spell2.Enabled) table.AddRow("Atk Spell 2", Markup.Escape($"{vp.Spell2.SpellText} cada {vp.Spell2.IntervalMs}ms"));
 
             AnsiConsole.Write(table);
         }
@@ -247,46 +319,32 @@ namespace StressBotBenchmark
         //  LAUNCH + DASHBOARD (inalterados na lógica)
         // ════════════════════════════════════════════════════════
 
-        static async Task LaunchBotsAsync(BotConfig config, BotMetrics metrics, List<TibiaBot> bots)
+        static async Task DashboardLoopAsync(BotConfig config, BotMetrics metrics, IReadOnlyList<TibiaBot> bots, CancellationToken token)
         {
-            int burstCount = 0;
-            for (int i = 1; i <= config.BotCount; i++)
+            if (Console.IsOutputRedirected)
             {
-                string name = $"{config.Prefix}_{i.ToString($"D{config.AccountWidth}")}";
-                var bot = new TibiaBot(name, config.Password, config, metrics);
-                bots.Add(bot);
-                
-                _ = bot.StartAsync(); // Fire and forget
-                
-                if (config.LoginDelayMs > 0)
-                    await Task.Delay((int)config.LoginDelayMs);
-
-                burstCount++;
-                if (burstCount >= config.BurstSize)
+                while (!token.IsCancellationRequested)
                 {
-                    burstCount = 0;
-                    if (config.BurstPauseMs > 0)
-                        await Task.Delay((int)config.BurstPauseMs);
+                    Console.WriteLine($"{DateTime.Now:HH:mm:ss} InWorld={bots.Count(b => b.InWorld)}/{config.BotCount} TCP={metrics.ConnectedCount} Failures={metrics.ConnectionFailures} Disconnects={metrics.Disconnects} Reconnects={metrics.Reconnects} Ping={metrics.Pingbacks} Turns={metrics.Turns} LastError={metrics.LastError ?? "none"}");
+                    await Task.Delay(TimeSpan.FromSeconds(5), token);
                 }
+                return;
             }
-        }
-
-        static async Task DashboardLoopAsync(BotConfig config, BotMetrics metrics, List<TibiaBot> bots)
-        {
             long lastBytesIn = 0;
             long lastBytesOut = 0;
             int lastPacketsIn = 0;
+            int lastActions = 0;
 
-            var proc = System.Diagnostics.Process.GetCurrentProcess();
+            using var proc = System.Diagnostics.Process.GetCurrentProcess();
             TimeSpan lastCpuTime = proc.TotalProcessorTime;
             DateTime lastTime = DateTime.UtcNow;
 
             await AnsiConsole.Live(new Panel("Initializing..."))
                 .StartAsync(async ctx =>
                 {
-                    while (true)
+                    while (!token.IsCancellationRequested)
                     {
-                        await Task.Delay((int)config.DashboardIntervalMs);
+                        await Task.Delay((int)config.DashboardIntervalMs, token);
                         
                         long bytesInNow = metrics.BytesIn;
                         long bytesOutNow = metrics.BytesOut;
@@ -304,18 +362,21 @@ namespace StressBotBenchmark
 
                         TimeSpan cpuTime = proc.TotalProcessorTime;
                         DateTime now = DateTime.UtcNow;
+                        double sampleSeconds = Math.Max(0.001, (now - lastTime).TotalSeconds);
                         double cpuUsage = (cpuTime - lastCpuTime).TotalMilliseconds / (now - lastTime).TotalMilliseconds / Environment.ProcessorCount * 100.0;
                         lastCpuTime = cpuTime;
                         lastTime = now;
                         double ramMb = proc.PrivateMemorySize64 / 1024.0 / 1024.0;
 
-                        int inWorldCount = bots.FindAll(b => b.InWorld).Count;
+                        int inWorldCount = bots.Count(b => b.InWorld);
                         int target = config.BotCount;
                         string statusColor = inWorldCount >= target ? "green" : (inWorldCount > 0 ? "yellow" : "red");
 
                         int trackedMonstersTotal = bots.Sum(b => b.TrackedMonstersTotal);
 
-                        double actionsPerBot = inWorldCount > 0 ? ((double)packetsInSec / inWorldCount) : 0.0;
+                        int actions = metrics.Walks + metrics.Attacks + metrics.Spells + metrics.Chats + metrics.Turns;
+                        double actionsPerBot = inWorldCount > 0 ? (actions - lastActions) / sampleSeconds / inWorldCount : 0;
+                        lastActions = actions;
 
                         DateTime activeThreshold = DateTime.UtcNow.AddSeconds(-2);
                         int activeAttackers = bots.Count(b => b.LastAttackTime > activeThreshold);
@@ -335,6 +396,9 @@ namespace StressBotBenchmark
                             $"[{statusColor}]In-World: {inWorldCount} / {target}[/]", 
                             $"[{statusColor}]Disc: {metrics.Disconnects} | Reconn: {metrics.Reconnects}[/]"
                         );
+                        table.AddRow("Conexões", $"TCP: {metrics.ConnectedCount} | Falhas TCP: {metrics.ConnectionFailures}", $"Ping: {metrics.Pingbacks} | Turns: {metrics.Turns}");
+                        if (metrics.LastError is string lastError)
+                            table.AddRow("Último erro", Markup.Escape(lastError), "");
                         if (failedCount > 0)
                         {
                             var firstError = bots.FirstOrDefault(b => b.PermanentFailure)?.LastError ?? "?";
@@ -348,7 +412,7 @@ namespace StressBotBenchmark
                         }
                         table.AddRow(
                             "Network", 
-                            $"[blue]In:[/] {bytesInSec / 1024.0:F1} KB/s | [fuchsia]Out:[/] {bytesOutSec / 1024.0:F1} KB/s", 
+                            $"[blue]In:[/] {bytesInSec / sampleSeconds / 1024.0:F1} KB/s | [fuchsia]Out:[/] {bytesOutSec / sampleSeconds / 1024.0:F1} KB/s",
                             $"Pkt In: [blue]{metrics.PacketsIn}[/] | Out: [fuchsia]{metrics.Sent}[/]"
                         );
                         table.AddRow(
@@ -369,7 +433,7 @@ namespace StressBotBenchmark
                         table.AddRow(
                             "Tracking",
                             $"[green]Monsters Seen:[/] {trackedMonstersTotal} (Global)",
-                            $"[green]Avg Queue Wait:[/] 0.00ms (C# Native ASIO)"
+                            $"[green]Avg Queue Wait:[/] {metrics.AvgQueueWaitMs:F2}ms"
                         );
 
                         var panel = new Panel(table)

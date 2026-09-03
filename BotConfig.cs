@@ -62,9 +62,9 @@ namespace StressBotBenchmark
         public int AccountWidth { get; set; } = 3;
 
         // ─── Login rate ─────────────────────────────────────
-        public double LoginDelayMs { get; set; } = 100;
-        public int BurstSize { get; set; } = 5;
-        public double BurstPauseMs { get; set; } = 1000;
+        public double LoginDelayMs { get; set; } = 650;
+        public int BurstSize { get; set; } = 1;
+        public double BurstPauseMs { get; set; } = 0;
 
         // ─── Vocação / Combate ──────────────────────────────
         public VocationProfile VocationConfig { get; set; } = new();
@@ -93,6 +93,11 @@ namespace StressBotBenchmark
         public int QueueSize { get; set; } = 32;
         public int MaxSendLagMsToDrop { get; set; } = 1200;
         public double PingbackMinIntervalMs { get; set; } = 5000;
+        // OS 2 / TFS 8.60 accepts periodic 0x1E heartbeats, including when its
+        // ping is bundled after map data that the lightweight parser skips.
+        public double KeepAliveIntervalMs { get; set; } = 5000;
+        // Turn in place to reset TFS's separate idle timer. Zero disables it.
+        public double IdleTurnIntervalMs { get; set; } = 60000;
 
         // ── Presets rápidos por vocação ──────────────────────
         public static VocationProfile PresetKnight() => new()

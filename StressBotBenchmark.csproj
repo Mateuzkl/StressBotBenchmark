@@ -13,6 +13,7 @@
 
   <ItemGroup>
     <PackageReference Include="Spectre.Console" Version="0.54.0" />
+    <None Update="scripts\*.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

@@ -1,5 +1,23 @@
 # StressBotBenchmark
 
+## Branch tfs — conexões persistentes
+
+Use `scripts/tfs-1000.json` para conectar as contas `test_001` até `test_1000`
+ao TFS 1.8/8.60, com ping periódico, reconexão e mudança de direção para evitar
+inatividade. O intervalo global mínimo de 650 ms também vale nas reconexões;
+a subida de 1000 bots leva aproximadamente 11 minutos sem falhas.
+
+Após compilar em Release, execute:
+
+```powershell
+dotnet run -c Release --no-build -- --script=tfs-1000
+```
+
+Consulte [docs/TFS-SETUP.md](docs/TFS-SETUP.md) para configuração do servidor,
+outros argumentos e limitações. A adaptação completa do benchmark permanece
+pendente. As seções abaixo descrevem a versão original do projeto; para esta
+branch, siga o guia TFS.
+
 StressBotBenchmark is a .NET 8 console benchmark tool for spawning a large number of lightweight game bots, connecting them to a server, and tracking live load metrics in the terminal.
 
 The current implementation is tailored to a Tibia-like protocol stack and is tightly coupled to:
