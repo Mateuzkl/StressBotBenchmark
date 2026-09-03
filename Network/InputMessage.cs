@@ -18,6 +18,8 @@ namespace StressBotBenchmark.Network
 
         public InputMessage(byte[] buffer, int start, int end)
         {
+            if (start < 0 || end < start || end > buffer.Length)
+                throw new ArgumentOutOfRangeException(nameof(end));
             _buffer = buffer;
             _pos = start;
             _endpos = end;
@@ -29,13 +31,13 @@ namespace StressBotBenchmark.Network
         
         public byte GetU8()
         {
-            if (_pos >= _endpos) return 0;
+            Require(1);
             return _buffer[_pos++];
         }
 
         public ushort GetU16()
         {
-            if (_pos + 1 >= _endpos) return 0;
+            Require(2);
             ushort val = (ushort)(_buffer[_pos] | (_buffer[_pos + 1] << 8));
             _pos += 2;
             return val;
@@ -43,7 +45,7 @@ namespace StressBotBenchmark.Network
 
         public uint GetU32()
         {
-            if (_pos + 3 >= _endpos) return 0;
+            Require(4);
             uint val = (uint)(_buffer[_pos] | (_buffer[_pos + 1] << 8) | (_buffer[_pos + 2] << 16) | (_buffer[_pos + 3] << 24));
             _pos += 4;
             return val;
@@ -52,7 +54,7 @@ namespace StressBotBenchmark.Network
         public string GetString()
         {
             ushort len = GetU16();
-            if (_pos + len > _endpos) return string.Empty;
+            Require(len);
             string s = Encoding.Latin1.GetString(_buffer, _pos, len);
             _pos += len;
             return s;
@@ -60,7 +62,7 @@ namespace StressBotBenchmark.Network
         
         public byte[] GetBytes(int len)
         {
-            if (_pos + len > _endpos) return Array.Empty<byte>();
+            Require(len);
             byte[] b = new byte[len];
             Array.Copy(_buffer, _pos, b, 0, len);
             _pos += len;
@@ -69,7 +71,14 @@ namespace StressBotBenchmark.Network
 
         public void Skip(int count)
         {
+            Require(count);
             _pos += count;
+        }
+
+        private void Require(int count)
+        {
+            if (count < 0 || count > Remaining)
+                throw new InvalidDataException("Truncated server message.");
         }
     }
 }

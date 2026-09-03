@@ -45,6 +45,8 @@ namespace StressBotBenchmark
         public bool Connected => _connected;
         public string? LastError => _lastError;
         public bool PermanentFailure => _permanentFailure;
+        public PlayerStats? Stats { get; private set; }
+        public string? LastServerMessage { get; private set; }
         public DateTime LastWalkTime { get; private set; } = DateTime.MinValue;
         public DateTime LastSpellTime { get; private set; } = DateTime.MinValue;
         public DateTime LastAttackTime { get; private set; } = DateTime.MinValue;
@@ -135,6 +137,8 @@ namespace StressBotBenchmark
         private void CleanupConnection()
         {
             _inWorld = false;
+            Stats = null;
+            LastServerMessage = null;
             if (_connected)
             {
                 _connected = false;
@@ -179,7 +183,7 @@ namespace StressBotBenchmark
                     throw new InvalidDataException("Invalid TFS 8.60 challenge.");
 
                 await SendLoginMessageAsync(BitConverter.ToUInt32(challenge, 7), challenge[11], handshake.Token);
-                // Do not discard the first packet: it contains the 0x0A login acknowledgement.
+                // TFS can bundle stats from equipment loading BEFORE the 0x0A acknowledgement.
                 while (!_inWorld)
                     await ProcessEncryptedPacketAsync(await ReadMessageAsync(handshake.Token), handshake.Token);
             }
@@ -294,6 +298,23 @@ namespace StressBotBenchmark
                         if (playerId == 0) throw new InvalidDataException("Invalid player ID.");
                         payload.Skip(3); // beat duration + can-report-bugs
                         _inWorld = true;
+                        // The first map contains the initial targets; it must be
+                        // observed even though this packet started before InWorld.
+                        if (!_config.LoginOnly) TrackLegacyCombat(payload);
+                        continue;
+                    case 0xA0:
+                        // This TFS fork sends 32-bit HP/MP even for OS 2 / version 860.
+                        Stats = PlayerStats.Read(payload);
+                        continue;
+                    case 0xA1:
+                        payload.Skip(14); // seven (skill level, percent) pairs, OS 2
+                        continue;
+                    case 0xA2:
+                        payload.Skip(2); // condition icons, OS 2
+                        continue;
+                    case 0xB4:
+                        payload.GetU8(); // message class
+                        LastServerMessage = payload.GetString();
                         continue;
                     case 0x14:
                         throw new IOException(payload.GetString());
