@@ -1,7 +1,10 @@
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Security.Cryptography;
+using StressBotBenchmark.AI;
 using StressBotBenchmark.Network;
+using StressBotBenchmark.Protocol;
+using StressBotBenchmark.World;
 
 namespace StressBotBenchmark
 {
@@ -26,6 +29,13 @@ namespace StressBotBenchmark
         private long _lastSend;
         private long _lastPing;
         private bool _fightModesSent;
+
+        // ── New: structured world state and protocol parser ──
+        private readonly WorldState _worldState = new();
+        private Protocol860Parser? _parser;
+        private BotBrain? _brain;
+
+        // Legacy compat — kept for dashboard until Phase 7 upgrades metrics
         private readonly List<uint> _recentMonsters = new();
         private readonly HashSet<uint> _allSeenMonsters = new();
         private readonly object _monsterLock = new();
@@ -51,7 +61,10 @@ namespace StressBotBenchmark
         public DateTime LastSpellTime { get; private set; } = DateTime.MinValue;
         public DateTime LastAttackTime { get; private set; } = DateTime.MinValue;
         public DateTime LastDamageTakenTime { get; private set; } = DateTime.MinValue;
-        public int TrackedMonstersTotal { get { lock (_monsterLock) return _allSeenMonsters.Count; } }
+        public int TrackedMonstersTotal => _worldState.CountVisibleMonsters();
+
+        /// <summary>Structured world state for AI and dashboard access.</summary>
+        public WorldState World => _worldState;
 
         public async Task StartAsync(CancellationToken cancellationToken = default)
         {
@@ -149,6 +162,8 @@ namespace StressBotBenchmark
             _stream = null;
             _client = null;
             _fightModesSent = false;
+            _parser = null;
+            _worldState.Clear();
             lock (_monsterLock)
             {
                 _recentMonsters.Clear();
@@ -169,6 +184,15 @@ namespace StressBotBenchmark
             _connected = true;
             _metrics.Connected();
             _lastSend = _lastPing = 0;
+
+            // Create structured parser for this session
+            _parser = new Protocol860Parser(_worldState, _metrics);
+            _parser.OnPingReceived = async () => await SendPingBackAsync(token);
+            _parser.OnLoginAck = () => { _inWorld = true; };
+            _parser.OnDisconnect = msg => throw new IOException(msg);
+            _parser.OnDisconnectWait = (msg, retry) => throw new LoginWaitException(msg, retry);
+            _parser.OnTextMessage = msg => { LastServerMessage = msg; };
+
             byte[] keyBytes = RandomNumberGenerator.GetBytes(16);
             for (int i = 0; i < 4; i++)
                 _xteaKey[i] = BitConverter.ToUInt32(keyBytes, i * 4);
@@ -191,10 +215,17 @@ namespace StressBotBenchmark
             var tasks = new List<Task> { ReadLoopAsync(token), KeepAliveLoopAsync(token), IdleTurnLoopAsync(token) };
             if (!_config.LoginOnly)
             {
-                tasks.Add(WalkLoopAsync(token));
-                tasks.Add(ChatLoopAsync(token));
-                tasks.Add(SpellLoopAsync(token));
-                tasks.Add(AttackLoopAsync(token));
+                if (_config.AiEnabled)
+                {
+                    tasks.Add(BrainLoopAsync(token));
+                }
+                else
+                {
+                    tasks.Add(WalkLoopAsync(token));
+                    tasks.Add(ChatLoopAsync(token));
+                    tasks.Add(SpellLoopAsync(token));
+                    tasks.Add(AttackLoopAsync(token));
+                }
             }
             try
             {
@@ -281,103 +312,45 @@ namespace StressBotBenchmark
             await ProcessPayloadAsync(new InputMessage(encrypted, 2, length + 2), token);
         }
 
-        private async Task ProcessPayloadAsync(InputMessage payload, CancellationToken token)
+        private Task ProcessPayloadAsync(InputMessage payload, CancellationToken token)
         {
-            if (!_config.LoginOnly && _inWorld) TrackLegacyCombat(payload);
-            // Read only opcodes whose complete layout is known. Never scan arbitrary
-            // map/item bytes for ping or login markers.
-            while (payload.Remaining > 0)
-            {
-                byte opcode = payload.GetU8();
-                switch (opcode)
-                {
-                    case 0x0A:
-                        if (payload.Remaining < 7)
-                            throw new InvalidDataException("Truncated login acknowledgement.");
-                        uint playerId = payload.GetU32();
-                        if (playerId == 0) throw new InvalidDataException("Invalid player ID.");
-                        payload.Skip(3); // beat duration + can-report-bugs
-                        _inWorld = true;
-                        // The first map contains the initial targets; it must be
-                        // observed even though this packet started before InWorld.
-                        if (!_config.LoginOnly) TrackLegacyCombat(payload);
-                        continue;
-                    case 0xA0:
-                        // This TFS fork sends 32-bit HP/MP even for OS 2 / version 860.
-                        Stats = PlayerStats.Read(payload);
-                        continue;
-                    case 0xA1:
-                        payload.Skip(14); // seven (skill level, percent) pairs, OS 2
-                        continue;
-                    case 0xA2:
-                        payload.Skip(2); // condition icons, OS 2
-                        continue;
-                    case 0xB4:
-                        payload.GetU8(); // message class
-                        LastServerMessage = payload.GetString();
-                        continue;
-                    case 0x14:
-                        throw new IOException(payload.GetString());
-                    case 0x16:
-                        string reason = payload.GetString();
-                        throw new LoginWaitException(reason, payload.GetU8());
-                    case 0x1E:
-                    case 0x1D:
-                        await SendPingBackAsync(token);
-                        continue;
-                    default:
-                        // Full map/combat parsing remains separate from connection
-                        // liveness. Periodic 0x1E works even with a bundled ping.
-                        return;
-                }
-            }
-        }
+            if (_parser == null) return Task.CompletedTask;
 
-        // Retained for existing combat profiles; this is not a full creature parser.
-        private void TrackLegacyCombat(InputMessage payload)
-        {
+            bool becameInWorld = _parser.ProcessPayload(payload, _inWorld);
+            if (becameInWorld)
+            {
+                _inWorld = true;
+            }
+
+            // Sync legacy Stats property from world state for backward compat
+            var p = _worldState.Player;
+            if (p.MaxHp > 0)
+            {
+                Stats = new PlayerStats(p.Hp, p.MaxHp, p.Mana, p.MaxMana, p.Level);
+            }
+
+            // Sync damage time from world state
+            if (p.LastDamageTakenTime > LastDamageTakenTime)
+                LastDamageTakenTime = p.LastDamageTakenTime;
+
+            // Populate legacy monster lists from WorldState for backward compat
             if (_config.EnableAttack)
             {
-                int length = payload.Remaining;
-                int offset = payload.Position;
-                byte[] buf = payload.Buffer;
-
-                // Monster ID heuristic scanner
-                for (int i = 0; i <= length - 4; i++)
+                lock (_monsterLock)
                 {
-                    uint val = BitConverter.ToUInt32(buf, offset + i);
-                    if (val >= 0x40000000 && val <= 0x401FFFFF)
+                    foreach (var creature in _worldState.GetVisibleMonsters())
                     {
-                        lock (_monsterLock)
+                        _allSeenMonsters.Add(creature.Id);
+                        if (!_recentMonsters.Contains(creature.Id))
                         {
-                            _allSeenMonsters.Add(val);
-                            if (!_recentMonsters.Contains(val))
-                            {
-                                _recentMonsters.Add(val);
-                                if (_recentMonsters.Count > 10) _recentMonsters.RemoveAt(0);
-                            }
+                            _recentMonsters.Add(creature.Id);
+                            if (_recentMonsters.Count > 10) _recentMonsters.RemoveAt(0);
                         }
                     }
                 }
-
-                // Damage heuristic scanner
-                for (int i = 0; i <= length - 11; i++)
-                {
-                    if (buf[offset + i] == 89 && buf[offset + i + 1] == 111 && buf[offset + i + 2] == 117 &&
-                        buf[offset + i + 3] == 32 && buf[offset + i + 4] == 108 && buf[offset + i + 5] == 111 &&
-                        buf[offset + i + 6] == 115 && buf[offset + i + 7] == 101 && buf[offset + i + 8] == 32)
-                    {
-                        LastDamageTakenTime = DateTime.UtcNow;
-                    }
-                    if (buf[offset + i] == 121 && buf[offset + i + 1] == 111 && buf[offset + i + 2] == 117 &&
-                        buf[offset + i + 3] == 114 && buf[offset + i + 4] == 32 && buf[offset + i + 5] == 97 &&
-                        buf[offset + i + 6] == 116 && buf[offset + i + 7] == 116 && buf[offset + i + 8] == 97 &&
-                        buf[offset + i + 9] == 99 && buf[offset + i + 10] == 107)
-                    {
-                        LastAttackTime = DateTime.UtcNow;
-                    }
-                }
             }
+
+            return Task.CompletedTask;
         }
 
         private async Task KeepAliveLoopAsync(CancellationToken token)
@@ -500,22 +473,36 @@ namespace StressBotBenchmark
             }
         }
 
+        // Humanized chat messages — short, varied, rare
+        private static readonly string[] _chatMessages = {
+            "hi", "hello", "lol", "kk", "kkk", "hmm", "go?", "brb",
+            "mana", "heal", "gg", "xd", "nice", "thx", "ty", "lf pt",
+            "anyone?", "afk", "back", "gl", "hf", "wb",
+            "e ai", "opa", "vlw", "ss", "cya"
+        };
+
         private async Task ChatLoopAsync(CancellationToken token)
         {
             if (!_config.EnableChat) { await Task.Delay(-1, token); return; }
             Random rand = new Random();
-            await Task.Delay(rand.Next(500, 4000), token);
+            await Task.Delay(rand.Next(5000, 30000), token); // Long initial delay
 
             while (!token.IsCancellationRequested)
             {
-                int jitter = rand.Next((int)(-(_config.ChatIntervalMs * 0.2)), (int)(_config.ChatIntervalMs * 0.2));
-                await Task.Delay((int)_config.ChatIntervalMs + jitter, token);
+                // Long interval + big jitter = rare and desynchronized chat
+                int baseInterval = Math.Max(15000, (int)_config.ChatIntervalMs);
+                int jitter = rand.Next(baseInterval / 2, baseInterval * 2);
+                await Task.Delay(baseInterval + jitter, token);
                 if (!_inWorld) continue;
-                
+
+                // Only chat with a small chance per tick to avoid 500 bots talking at once
+                if (rand.NextDouble() > 0.3) continue;
+
+                string text = _chatMessages[rand.Next(_chatMessages.Length)];
                 var msg = new OutputMessage();
                 msg.AddU8(0x96); // TALK
-                msg.AddU8(1);
-                msg.AddString($"Hello_im_csharp_bot_{_name}");
+                msg.AddU8(1);    // SAY
+                msg.AddString(text);
                 await SendRawGameMessageAsync(msg, token);
                 _metrics.IncChats();
             }
@@ -537,17 +524,42 @@ namespace StressBotBenchmark
 
             var rand = new Random();
             var lastCast = new DateTime[slots.Length];
-            await Task.Delay(rand.Next(200, 2000), token);
+            await Task.Delay(rand.Next(500, 3000), token);
 
             while (!token.IsCancellationRequested)
             {
                 await Task.Delay(500, token); // tick rate
                 if (!_inWorld) continue;
 
+                // ── RULE: Only cast offensive spells when there is a VALID target ──
+                // Check WorldState for a valid target first
+                uint currentTarget = _worldState.Player.CurrentTargetId;
+                bool hasValidTarget = false;
+
+                if (currentTarget != 0)
+                {
+                    var target = _worldState.GetCreature(currentTarget);
+                    hasValidTarget = target != null &&
+                                     target.Visible &&
+                                     target.HealthPercent > 0 &&
+                                     target.Z == _worldState.Player.Z;
+                }
+
+                // Also check if we recently sent an attack (fallback for when
+                // WorldState target tracking hasn't caught up yet)
+                if (!hasValidTarget && (DateTime.UtcNow - LastAttackTime).TotalSeconds > 3)
+                    continue; // No target, no spell
+
+                // Check mana availability from WorldState
+                double manaPercent = _worldState.Player.ManaPercent;
+
                 for (int i = 0; i < slots.Length; i++)
                 {
                     var slot = slots[i];
                     if ((DateTime.UtcNow - lastCast[i]).TotalMilliseconds < slot.IntervalMs) continue;
+
+                    // Respect MinManaPercent — don't cast if mana is too low
+                    if (manaPercent < slot.MinManaPercent) continue;
 
                     var msg = new OutputMessage();
                     msg.AddU8(0x96); // TALK
@@ -562,6 +574,11 @@ namespace StressBotBenchmark
             }
         }
 
+        // Current attack target — maintained across ticks
+        private uint _currentAttackTarget;
+        private DateTime _targetAcquiredTime = DateTime.MinValue;
+        private DateTime _lastAttackSentTime = DateTime.MinValue;
+
         private async Task AttackLoopAsync(CancellationToken token)
         {
             if (!_config.EnableAttack) { await Task.Delay(-1, token); return; }
@@ -574,33 +591,120 @@ namespace StressBotBenchmark
                 await Task.Delay((int)_config.AttackScanIntervalMs + jitter, token);
                 if (!_inWorld) continue;
 
+                // Send fight modes once per session
                 if (!_fightModesSent)
                 {
-                    var modeMsg = new OutputMessage();
-                    modeMsg.AddU8(0xA0); // CHANGE FIGHT MODES
-                    modeMsg.AddU8(_config.FightMode); // 1 = Offensive, etc
-                    modeMsg.AddU8((byte)(_config.EnableChaseMode ? 1 : 0)); // 1 = Chase, 0 = Stand
-                    modeMsg.AddU8((byte)(_config.SafeFight ? 1 : 0));
+                    var modeMsg = Protocol860Writer.FightModes(
+                        _config.FightMode,
+                        (byte)(_config.EnableChaseMode ? 1 : 0),
+                        (byte)(_config.SafeFight ? 1 : 0));
                     await SendRawGameMessageAsync(modeMsg, token);
                     _fightModesSent = true;
                 }
 
-                uint targetId = 0;
-                lock (_monsterLock)
+                // ── TARGET VALIDATION ──
+                // Check if current target is still valid
+                bool targetValid = false;
+                if (_currentAttackTarget != 0)
                 {
-                    if (_recentMonsters.Count > 0)
+                    var target = _worldState.GetCreature(_currentAttackTarget);
+                    targetValid = target != null &&
+                                  target.Visible &&
+                                  target.HealthPercent > 0 &&
+                                  target.Z == _worldState.Player.Z &&
+                                  target.Type == CreatureType.Monster;
+                }
+
+                // ── TARGET ACQUISITION ──
+                // If no valid target, find the best one from WorldState
+                if (!targetValid)
+                {
+                    _currentAttackTarget = 0;
+                    _worldState.Player.CurrentTargetId = 0;
+
+                    // Find closest visible monster on same floor with HP > 0
+                    uint bestId = 0;
+                    int bestDist = int.MaxValue;
+                    var px = _worldState.Player.X;
+                    var py = _worldState.Player.Y;
+
+                    foreach (var monster in _worldState.GetVisibleMonsters())
                     {
-                        targetId = _recentMonsters[rand.Next(_recentMonsters.Count)];
+                        int dist = monster.ChebyshevDistanceTo(px, py);
+                        if (dist < bestDist)
+                        {
+                            bestDist = dist;
+                            bestId = monster.Id;
+                        }
+                    }
+
+                    if (bestId != 0)
+                    {
+                        _currentAttackTarget = bestId;
+                        _worldState.Player.CurrentTargetId = bestId;
+                        _targetAcquiredTime = DateTime.UtcNow;
                     }
                 }
 
-                if (targetId != 0)
+                // ── SEND ATTACK ──
+                if (_currentAttackTarget != 0)
                 {
-                    var attackMsg = new OutputMessage();
-                    attackMsg.AddU8(0xA1); // ATTACK
-                    attackMsg.AddU32(targetId);
+                    var attackMsg = Protocol860Writer.Attack(_currentAttackTarget);
                     await SendRawGameMessageAsync(attackMsg, token);
                     _metrics.IncAttacks();
+                    LastAttackTime = DateTime.UtcNow;
+                    _lastAttackSentTime = DateTime.UtcNow;
+                }
+            }
+        }
+
+        private async Task BrainLoopAsync(CancellationToken token)
+        {
+            int seed = _config.RandomSeed.HasValue
+                ? _config.RandomSeed.Value ^ _name.GetHashCode()
+                : _name.GetHashCode() ^ Environment.TickCount;
+
+            _brain = new BotBrain(_worldState, _config, seed);
+
+            var rng = new Random(seed);
+            // Stagger initial start so bots don't all tick on the exact same millisecond
+            await Task.Delay(rng.Next(200, 1500), token);
+
+            while (!token.IsCancellationRequested)
+            {
+                // Tick interval: 150-250ms + light jitter
+                int jitter = rng.Next(-25, 26);
+                await Task.Delay(200 + jitter, token);
+
+                if (!_inWorld) continue;
+
+                var actionMsg = _brain.Tick();
+                if (actionMsg != null)
+                {
+                    await SendRawGameMessageAsync(actionMsg, token);
+
+                    // Track metrics based on action sent
+                    byte opcode = actionMsg.GetBuffer()[0];
+                    if (opcode >= 0x65 && opcode <= 0x6D)
+                    {
+                        _metrics.IncWalks();
+                        LastWalkTime = DateTime.UtcNow;
+                    }
+                    else if (opcode == 0x64) // autowalk
+                    {
+                        _metrics.IncWalks();
+                        LastWalkTime = DateTime.UtcNow;
+                    }
+                    else if (opcode == 0xA1) // attack
+                    {
+                        _metrics.IncAttacks();
+                        LastAttackTime = DateTime.UtcNow;
+                    }
+                    else if (opcode == 0x96) // say (spell, heal, or chat)
+                    {
+                        _metrics.IncSpells();
+                        LastSpellTime = DateTime.UtcNow;
+                    }
                 }
             }
         }

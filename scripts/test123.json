@@ -1,0 +1,78 @@
+{
+  "host": "127.0.0.1",
+  "port": 7172,
+  "botCount": 1000,
+  "prefix": "teste123",
+  "password": "test123",
+  "accountWidth": 3,
+  "loginDelayMs": 650,
+  "burstSize": 1,
+  "burstPauseMs": 0,
+  "vocationConfig": {
+    "vocation": "Knight",
+    "heal1": {
+      "enabled": true,
+      "spellText": "exura ico",
+      "thresholdPercent": 75,
+      "cooldownMs": 2000
+    },
+    "heal2": {
+      "enabled": true,
+      "spellText": "exura gran ico",
+      "thresholdPercent": 35,
+      "cooldownMs": 120000
+    },
+    "healMana": {
+      "enabled": false,
+      "spellText": "",
+      "thresholdPercent": 60,
+      "cooldownMs": 1000
+    },
+    "spell1": {
+      "enabled": true,
+      "spellText": "exori",
+      "intervalMs": 4000,
+      "minManaPercent": 20
+    },
+    "spell2": {
+      "enabled": true,
+      "spellText": "exori gran",
+      "intervalMs": 6000,
+      "minManaPercent": 35
+    },
+    "spell3": {
+      "enabled": true,
+      "spellText": "exori hur",
+      "intervalMs": 6000,
+      "minManaPercent": 15
+    },
+    "spell4": {
+      "enabled": false,
+      "spellText": "",
+      "intervalMs": 2000,
+      "minManaPercent": 30
+    }
+  },
+  "aiEnabled": true,
+  "behaviorProfile": "mixed",
+  "enableRandomWalk": true,
+  "walkIntervalMs": 1500,
+  "enableChat": true,
+  "chatIntervalMs": 30000,
+  "enableSpell": true,
+  "spellIntervalMs": 4000,
+  "spellText": "exori",
+  "enableAttack": true,
+  "attackScanIntervalMs": 2000,
+  "enableChaseMode": true,
+  "fightMode": 1,
+  "safeFight": false,
+  "dashboardIntervalMs": 1000,
+  "loginOnly": false,
+  "reconnect": true,
+  "queueSize": 32,
+  "maxSendLagMsToDrop": 1200,
+  "pingbackMinIntervalMs": 5000,
+  "keepAliveIntervalMs": 5000,
+  "idleTurnIntervalMs": 60000
+}

@@ -1,0 +1,58 @@
+{
+  "host": "127.0.0.1",
+  "port": 7172,
+  "botCount": 100,
+  "prefix": "stressbot",
+  "password": "test123",
+  "accountWidth": 4,
+  "loginDelayMs": 650,
+  "burstSize": 1,
+  "burstPauseMs": 0,
+  "loginOnly": false,
+  "reconnect": true,
+  "enableRandomWalk": true,
+  "enableChat": true,
+  "enableSpell": true,
+  "enableAttack": true,
+  "enableChaseMode": true,
+  "fightMode": 1,
+  "safeFight": false,
+  "aiEnabled": true,
+  "behaviorProfile": "mixed",
+  "keepAliveIntervalMs": 5000,
+  "idleTurnIntervalMs": 60000,
+  "dashboardIntervalMs": 1000,
+  "vocationConfig": {
+    "vocation": "Knight",
+    "heal1": {
+      "enabled": true,
+      "spellText": "exura ico",
+      "thresholdPercent": 75,
+      "cooldownMs": 2000
+    },
+    "heal2": {
+      "enabled": true,
+      "spellText": "exura gran ico",
+      "thresholdPercent": 35,
+      "cooldownMs": 120000
+    },
+    "spell1": {
+      "enabled": true,
+      "spellText": "exori",
+      "intervalMs": 4000,
+      "minManaPercent": 25
+    },
+    "spell2": {
+      "enabled": true,
+      "spellText": "exori gran",
+      "intervalMs": 6000,
+      "minManaPercent": 40
+    },
+    "spell3": {
+      "enabled": true,
+      "spellText": "exori hur",
+      "intervalMs": 6000,
+      "minManaPercent": 15
+    }
+  }
+}

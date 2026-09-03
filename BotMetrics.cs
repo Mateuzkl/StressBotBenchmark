@@ -27,6 +27,8 @@ namespace StressBotBenchmark
         private int _chats;
         private int _spells;
         private int _attacks;
+        private int _heals;
+        private int _potions;
         private int _reconnects;
         private int _disconnects;
         private int _packetsIn;
@@ -49,6 +51,8 @@ namespace StressBotBenchmark
         public int Chats => _chats;
         public int Spells => _spells;
         public int Attacks => _attacks;
+        public int Heals => _heals;
+        public int Potions => _potions;
         public int Reconnects => _reconnects;
         public int Disconnects => _disconnects;
         public int PacketsIn => _packetsIn;
@@ -72,6 +76,8 @@ namespace StressBotBenchmark
         public void IncChats() => Interlocked.Increment(ref _chats);
         public void IncSpells() => Interlocked.Increment(ref _spells);
         public void IncAttacks() => Interlocked.Increment(ref _attacks);
+        public void IncHeals() => Interlocked.Increment(ref _heals);
+        public void IncPotions() => Interlocked.Increment(ref _potions);
         public void IncReconnects() => Interlocked.Increment(ref _reconnects);
         public void IncDisconnects() => Interlocked.Increment(ref _disconnects);
         public void IncPacketsIn() => Interlocked.Increment(ref _packetsIn);

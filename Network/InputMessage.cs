@@ -75,6 +75,34 @@ namespace StressBotBenchmark.Network
             _pos += count;
         }
 
+        /// <summary>Read a map position: u16 x, u16 y, u8 z.</summary>
+        public (ushort X, ushort Y, byte Z) GetPosition()
+        {
+            ushort x = GetU16();
+            ushort y = GetU16();
+            byte z = GetU8();
+            return (x, y, z);
+        }
+
+        /// <summary>Peek at the next u16 without advancing the cursor.</summary>
+        public ushort PeekU16()
+        {
+            Require(2);
+            return (ushort)(_buffer[_pos] | (_buffer[_pos + 1] << 8));
+        }
+
+        /// <summary>Read a signed 32-bit integer (little-endian).</summary>
+        public int GetI32()
+        {
+            Require(4);
+            int val = _buffer[_pos] | (_buffer[_pos + 1] << 8) | (_buffer[_pos + 2] << 16) | (_buffer[_pos + 3] << 24);
+            _pos += 4;
+            return val;
+        }
+
+        /// <summary>Check whether at least <paramref name="count"/> bytes remain.</summary>
+        public bool CanRead(int count) => count >= 0 && count <= Remaining;
+
         private void Require(int count)
         {
             if (count < 0 || count > Remaining)

@@ -31,6 +31,12 @@ namespace StressBotBenchmark
         public int MinManaPercent { get; set; } = 30;      // só casta se mana >= X%
     }
 
+    public class ConsumablesConfig
+    {
+        public List<ushort> HealthPotionClientIds { get; set; } = new();
+        public List<ushort> ManaPotionClientIds { get; set; } = new();
+    }
+
     // ── Configuração de vocação ─────────────────────────────
     public class VocationProfile
     {
@@ -99,45 +105,55 @@ namespace StressBotBenchmark
         // Turn in place to reset TFS's separate idle timer. Zero disables it.
         public double IdleTurnIntervalMs { get; set; } = 60000;
 
-        // ── Presets rápidos por vocação ──────────────────────
+        // ─── AI Simulator Config ────────────────────────────
+        public bool AiEnabled { get; set; } = true;
+        public int? RandomSeed { get; set; }
+        public string BehaviorProfile { get; set; } = "mixed";
+        public ConsumablesConfig Consumables { get; set; } = new();
+        public List<string> ChatMessages { get; set; } = new();
+
+        // ── Presets rápidos por vocação (alinhados com TFS 8.60) ──────
         public static VocationProfile PresetKnight() => new()
         {
             Vocation = Vocation.Knight,
-            Heal1 = new() { Enabled = true, SpellText = "exura ico", ThresholdPercent = 70, CooldownMs = 1000 },
-            Heal2 = new() { Enabled = true, SpellText = "exura gran ico", ThresholdPercent = 40, CooldownMs = 1200 },
+            Heal1 = new() { Enabled = true, SpellText = "exura ico", ThresholdPercent = 75, CooldownMs = 2000 },
+            Heal2 = new() { Enabled = true, SpellText = "exura gran ico", ThresholdPercent = 35, CooldownMs = 120000 }, // 120s cooldown no TFS
             HealMana = new(),
-            Spell1 = new() { Enabled = true, SpellText = "exori", IntervalMs = 2000, MinManaPercent = 20 },
-            Spell2 = new() { Enabled = true, SpellText = "exori gran", IntervalMs = 4000, MinManaPercent = 30 },
+            Spell1 = new() { Enabled = true, SpellText = "exori", IntervalMs = 4000, MinManaPercent = 25 }, // 4s cooldown no TFS
+            Spell2 = new() { Enabled = true, SpellText = "exori gran", IntervalMs = 6000, MinManaPercent = 40 }, // 6s cooldown no TFS
+            Spell3 = new() { Enabled = true, SpellText = "exori hur", IntervalMs = 6000, MinManaPercent = 15 },
         };
 
         public static VocationProfile PresetPaladin() => new()
         {
             Vocation = Vocation.Paladin,
-            Heal1 = new() { Enabled = true, SpellText = "exura", ThresholdPercent = 70, CooldownMs = 1000 },
-            Heal2 = new() { Enabled = true, SpellText = "exura gran", ThresholdPercent = 40, CooldownMs = 1200 },
+            Heal1 = new() { Enabled = true, SpellText = "exura", ThresholdPercent = 75, CooldownMs = 1000 },
+            Heal2 = new() { Enabled = true, SpellText = "exura san", ThresholdPercent = 45, CooldownMs = 1000 },
             HealMana = new(),
             Spell1 = new() { Enabled = true, SpellText = "exori con", IntervalMs = 2000, MinManaPercent = 20 },
-            Spell2 = new() { Enabled = true, SpellText = "exevo mas san", IntervalMs = 4000, MinManaPercent = 40 },
+            Spell2 = new() { Enabled = true, SpellText = "exevo mas san", IntervalMs = 4000, MinManaPercent = 40 }, // 4s cooldown no TFS
         };
 
         public static VocationProfile PresetSorcerer() => new()
         {
             Vocation = Vocation.Sorcerer,
-            Heal1 = new() { Enabled = true, SpellText = "exura", ThresholdPercent = 65, CooldownMs = 1000 },
-            Heal2 = new() { Enabled = true, SpellText = "exura vita", ThresholdPercent = 35, CooldownMs = 1200 },
+            Heal1 = new() { Enabled = true, SpellText = "exura", ThresholdPercent = 70, CooldownMs = 1000 },
+            Heal2 = new() { Enabled = true, SpellText = "exura vita", ThresholdPercent = 40, CooldownMs = 1000 },
             HealMana = new(),
-            Spell1 = new() { Enabled = true, SpellText = "exevo vis lux", IntervalMs = 2000, MinManaPercent = 25 },
-            Spell2 = new() { Enabled = true, SpellText = "exevo gran mas flam", IntervalMs = 4000, MinManaPercent = 50 },
+            Spell1 = new() { Enabled = true, SpellText = "exori vis", IntervalMs = 2000, MinManaPercent = 20 },
+            Spell2 = new() { Enabled = true, SpellText = "exevo vis lux", IntervalMs = 4000, MinManaPercent = 35 },
+            Spell3 = new() { Enabled = true, SpellText = "exevo gran mas flam", IntervalMs = 40000, MinManaPercent = 60 }, // 40s UE no TFS
         };
 
         public static VocationProfile PresetDruid() => new()
         {
             Vocation = Vocation.Druid,
             Heal1 = new() { Enabled = true, SpellText = "exura", ThresholdPercent = 70, CooldownMs = 1000 },
-            Heal2 = new() { Enabled = true, SpellText = "exura gran", ThresholdPercent = 40, CooldownMs = 1200 },
+            Heal2 = new() { Enabled = true, SpellText = "exura gran", ThresholdPercent = 45, CooldownMs = 1000 },
             HealMana = new(),
-            Spell1 = new() { Enabled = true, SpellText = "exevo gran mas frigo", IntervalMs = 2000, MinManaPercent = 25 },
-            Spell2 = new() { Enabled = true, SpellText = "exura gran mas res", IntervalMs = 6000, MinManaPercent = 60 },
+            Spell1 = new() { Enabled = true, SpellText = "exori frigo", IntervalMs = 2000, MinManaPercent = 20 },
+            Spell2 = new() { Enabled = true, SpellText = "exevo frigo hur", IntervalMs = 4000, MinManaPercent = 30 },
+            Spell3 = new() { Enabled = true, SpellText = "exevo gran mas frigo", IntervalMs = 40000, MinManaPercent = 60 }, // 40s UE no TFS
         };
     }
 }
