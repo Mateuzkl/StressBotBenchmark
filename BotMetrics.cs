@@ -8,6 +8,12 @@ namespace StressBotBenchmark
         private int _connectionFailures;
         private int _turns;
         private string? _lastError;
+        private int _parserErrors;
+        private int _unknownOpcodes;
+        public int ParserErrors => Volatile.Read(ref _parserErrors);
+        public int UnknownOpcodes => Volatile.Read(ref _unknownOpcodes);
+        public void IncParserErrors() => Interlocked.Increment(ref _parserErrors);
+        public void IncUnknownOpcodes() => Interlocked.Increment(ref _unknownOpcodes);
         public int ConnectedCount => Volatile.Read(ref _connected);
         public int ConnectionFailures => Volatile.Read(ref _connectionFailures);
         public int Turns => Volatile.Read(ref _turns);

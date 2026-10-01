@@ -325,7 +325,10 @@ namespace StressBotBenchmark
             {
                 while (!token.IsCancellationRequested)
                 {
-                    Console.WriteLine($"{DateTime.Now:HH:mm:ss} InWorld={bots.Count(b => b.InWorld)}/{config.BotCount} TCP={metrics.ConnectedCount} Failures={metrics.ConnectionFailures} Disconnects={metrics.Disconnects} Reconnects={metrics.Reconnects} Ping={metrics.Pingbacks} Turns={metrics.Turns} LastError={metrics.LastError ?? "none"}");
+                    Console.WriteLine($"{DateTime.Now:HH:mm:ss} InWorld={bots.Count(b => b.InWorld)}/{config.BotCount} TCP={metrics.ConnectedCount} Failures={metrics.ConnectionFailures} Disconnects={metrics.Disconnects} Reconnects={metrics.Reconnects} Ping={metrics.Pingbacks} Turns={metrics.Turns} " +
+                        $"PacketsIn={metrics.PacketsIn} PacketsOut={metrics.Sent} BytesIn={metrics.BytesIn} BytesOut={metrics.BytesOut} " +
+                        $"Walks={metrics.Walks} Attacks={metrics.Attacks} Spells={metrics.Spells} Chats={metrics.Chats} " +
+                        $"Dropped={metrics.Dropped} QueueFull={metrics.QueueFull} ParserErrors={metrics.ParserErrors} UnknownOpcodes={metrics.UnknownOpcodes} LastError={metrics.LastError ?? "none"}");
                     await Task.Delay(TimeSpan.FromSeconds(5), token);
                 }
                 return;

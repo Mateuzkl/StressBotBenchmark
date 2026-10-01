@@ -19,6 +19,18 @@ public static class CreatureParser
         uint creatureId;
         CreatureState creature;
 
+        if (marker == 0x0063)
+        {
+            // This fork's sendCreatureTurn writes only u32 id + u8 direction.
+            // Reading a full outfit here consumes the following opcode and can
+            // mistake a normal text message for a login disconnect.
+            creatureId = msg.GetU32();
+            creature = world.GetOrCreateCreature(creatureId);
+            creature.Direction = msg.GetU8();
+            creature.LastSeen = DateTime.UtcNow;
+            return creatureId;
+        }
+
         if (marker == ServerOpcodes.UnknownCreature) // 0x61
         {
             uint removeId = msg.GetU32();

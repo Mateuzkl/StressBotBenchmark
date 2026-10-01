@@ -252,6 +252,7 @@ public sealed class Protocol860Parser
                     // ── Unknown ─────────────────────────────────
                     default:
                         RecordUnknownOpcode(opcode, msg.Remaining);
+                        _metrics.IncUnknownOpcodes();
                         // Cannot continue — we don't know the opcode's payload size
                         return becameInWorld;
                 }
@@ -259,6 +260,7 @@ public sealed class Protocol860Parser
             catch (InvalidDataException)
             {
                 Interlocked.Increment(ref _totalParserErrors);
+                _metrics.IncParserErrors();
                 // Parsing failed partway through this opcode.
                 // We cannot recover position, so abort this payload.
                 return becameInWorld;
