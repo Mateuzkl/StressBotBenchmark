@@ -10,6 +10,15 @@ namespace StressBotBenchmark
         private string? _lastError;
         private int _parserErrors;
         private int _unknownOpcodes;
+        private readonly int[] _unknownByOpcode = new int[256];
+        private string? _lastParserError;
+        public string? LastParserError => Volatile.Read(ref _lastParserError);
+        public string UnknownSummary => string.Join(",", Enumerable.Range(0, 256)
+            .Where(i => Volatile.Read(ref _unknownByOpcode[i]) != 0)
+            .OrderByDescending(i => Volatile.Read(ref _unknownByOpcode[i])).Take(8)
+            .Select(i => $"0x{i:X2}:{Volatile.Read(ref _unknownByOpcode[i])}"));
+        public void RecordParserError(byte opcode, string error) => Volatile.Write(ref _lastParserError, $"0x{opcode:X2}: {error}");
+        public void RecordUnknown(byte opcode) => Interlocked.Increment(ref _unknownByOpcode[opcode]);
         public int ParserErrors => Volatile.Read(ref _parserErrors);
         public int UnknownOpcodes => Volatile.Read(ref _unknownOpcodes);
         public void IncParserErrors() => Interlocked.Increment(ref _parserErrors);
@@ -23,7 +32,7 @@ namespace StressBotBenchmark
         public void IncConnectionFailures() => Interlocked.Increment(ref _connectionFailures);
         public void IncTurns() => Interlocked.Increment(ref _turns);
         public void RecordError(string bot, string error) => Volatile.Write(ref _lastError, $"{bot}: {error}");
-        
+
         private int _enqueued;
         private int _sent;
         private int _dropped;
@@ -35,6 +44,7 @@ namespace StressBotBenchmark
         private int _attacks;
         private int _heals;
         private int _potions;
+        private int _outfits;
         private int _reconnects;
         private int _disconnects;
         private int _packetsIn;
@@ -47,7 +57,11 @@ namespace StressBotBenchmark
         private readonly object _lagLock = new object();
         private double _queueWaitMsSum;
         private long _queueWaitSamples;
-        
+        // Fixed-size cumulative histograms; no per-packet allocations or unbounded samples.
+        private static readonly double[] LagBounds = { 0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2000, 5000, double.PositiveInfinity };
+        private readonly long[] _queueHistogram = new long[LagBounds.Length];
+        private readonly long[] _sendHistogram = new long[LagBounds.Length];
+
         public int Enqueued => _enqueued;
         public int Sent => _sent;
         public int Dropped => _dropped;
@@ -59,6 +73,8 @@ namespace StressBotBenchmark
         public int Attacks => _attacks;
         public int Heals => _heals;
         public int Potions => _potions;
+        public int Outfits => Volatile.Read(ref _outfits);
+        public int Actions => Walks + Attacks + Spells + Heals + Potions + Chats + Turns + Outfits;
         public int Reconnects => _reconnects;
         public int Disconnects => _disconnects;
         public int PacketsIn => _packetsIn;
@@ -68,9 +84,26 @@ namespace StressBotBenchmark
         public double AvgDrainMs { get { lock (_lagLock) return _drainSamples > 0 ? _drainMsSum / _drainSamples : 0; } }
         public double MaxSendLagMs { get { lock (_lagLock) return _maxSendLagMs; } }
         public double AvgQueueWaitMs { get { lock (_lagLock) return _queueWaitSamples > 0 ? _queueWaitMsSum / _queueWaitSamples : 0; } }
+        public double QueueP95Ms { get { lock (_lagLock) return Percentile(_queueHistogram, _queueWaitSamples, 0.95); } }
+        public double QueueP99Ms { get { lock (_lagLock) return Percentile(_queueHistogram, _queueWaitSamples, 0.99); } }
+        public double SendP95Ms { get { lock (_lagLock) return Percentile(_sendHistogram, _drainSamples, 0.95); } }
+        public double SendP99Ms { get { lock (_lagLock) return Percentile(_sendHistogram, _drainSamples, 0.99); } }
+        private static void AddSample(long[] histogram, double ms)
+        {
+            for (int i = 0; i < LagBounds.Length; i++)
+                if (ms <= LagBounds[i]) { histogram[i]++; return; }
+        }
+        private static double Percentile(long[] histogram, long count, double percentile)
+        {
+            if (count == 0) return 0;
+            long threshold = (long)Math.Ceiling(count * percentile), seen = 0;
+            for (int i = 0; i < histogram.Length; i++)
+                if ((seen += histogram[i]) >= threshold) return LagBounds[i];
+            return double.PositiveInfinity;
+        }
         public void AddQueueWaitMs(double ms)
         {
-            lock (_lagLock) { _queueWaitMsSum += ms; _queueWaitSamples++; }
+            lock (_lagLock) { _queueWaitMsSum += ms; _queueWaitSamples++; AddSample(_queueHistogram, ms); }
         }
 
         public void IncEnqueued() => Interlocked.Increment(ref _enqueued);
@@ -84,6 +117,7 @@ namespace StressBotBenchmark
         public void IncAttacks() => Interlocked.Increment(ref _attacks);
         public void IncHeals() => Interlocked.Increment(ref _heals);
         public void IncPotions() => Interlocked.Increment(ref _potions);
+        public void IncOutfits() => Interlocked.Increment(ref _outfits);
         public void IncReconnects() => Interlocked.Increment(ref _reconnects);
         public void IncDisconnects() => Interlocked.Increment(ref _disconnects);
         public void IncPacketsIn() => Interlocked.Increment(ref _packetsIn);
@@ -96,6 +130,7 @@ namespace StressBotBenchmark
             {
                 _drainMsSum += ms;
                 _drainSamples++;
+                AddSample(_sendHistogram, ms);
                 if (ms > _maxSendLagMs) _maxSendLagMs = ms;
             }
         }

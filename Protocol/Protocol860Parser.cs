@@ -27,6 +27,7 @@ public sealed class Protocol860Parser
 {
     private readonly WorldState _world;
     private readonly BotMetrics _metrics;
+    private (ushort X, ushort Y, byte Z)? _playerMovedFrom;
 
     // Callbacks to TibiaBot for events that require network responses
     public Action? OnPingReceived;
@@ -86,8 +87,9 @@ public sealed class Protocol860Parser
 
                     // ── Ping ────────────────────────────────────
                     case ServerOpcodes.Ping:     // 0x1E
-                    case ServerOpcodes.PingBack:  // 0x1D
                         OnPingReceived?.Invoke();
+                        continue;
+                    case ServerOpcodes.PingBack:  // 0x1D — acknowledgement, not a new request
                         continue;
 
                     // ── Map ─────────────────────────────────────
@@ -103,6 +105,11 @@ public sealed class Protocol860Parser
                         continue;
 
                     // ── Tile updates ────────────────────────────
+                    case 0x69: // full tile refresh
+                        var tilePosition = msg.GetPosition();
+                        if (MapParser.ParseTileDescription(msg, _world, tilePosition.X, tilePosition.Y, tilePosition.Z) != 0)
+                            throw new InvalidDataException("Invalid single-tile skip.");
+                        continue;
                     case ServerOpcodes.AddTileThing:    // 0x6A
                         ParseAddTileThing(msg);
                         continue;
@@ -141,6 +148,12 @@ public sealed class Protocol860Parser
                     case ServerOpcodes.DistanceShoot: // 0x85
                         msg.Skip(5 + 5); // fromPos + toPos
                         msg.Skip(2); // u16 type
+                        continue;
+
+                    case 0x84: // animated damage/heal text: position, color, string
+                        msg.GetPosition();
+                        msg.GetU8();
+                        msg.GetString();
                         continue;
 
                     case ServerOpcodes.CreatureSquare: // 0x86
@@ -190,6 +203,17 @@ public sealed class Protocol860Parser
                         continue;
 
                     // ── Text ────────────────────────────────────
+                    case 0xAC: // channel opened by a login script
+                        msg.GetU16();
+                        msg.GetString();
+                        continue;
+                    case 0xAB: // channel list
+                        int channels = msg.GetU8();
+                        for (int channel = 0; channel < channels; channel++)
+                        {
+                            msg.GetU16(); msg.GetString();
+                        }
+                        continue;
                     case ServerOpcodes.TextMessage: // 0xB4
                         msg.GetU8(); // message class
                         string text = msg.GetString();
@@ -253,14 +277,16 @@ public sealed class Protocol860Parser
                     default:
                         RecordUnknownOpcode(opcode, msg.Remaining);
                         _metrics.IncUnknownOpcodes();
+                        _metrics.RecordUnknown(opcode);
                         // Cannot continue — we don't know the opcode's payload size
                         return becameInWorld;
                 }
             }
-            catch (InvalidDataException)
+            catch (InvalidDataException error)
             {
                 Interlocked.Increment(ref _totalParserErrors);
                 _metrics.IncParserErrors();
+                _metrics.RecordParserError(opcode, error.Message);
                 // Parsing failed partway through this opcode.
                 // We cannot recover position, so abort this payload.
                 return becameInWorld;
@@ -285,6 +311,8 @@ public sealed class Protocol860Parser
     {
         var (x, y, z) = msg.GetPosition();
         _world.Player.UpdatePosition(x, y, z);
+        _world.ClearMap();
+        _playerMovedFrom = null;
         MapParser.ParseMapDescription(msg, _world, x, y, z);
     }
 
@@ -328,7 +356,7 @@ public sealed class Protocol860Parser
             msg.GetU16(); // consume marker
             uint creatureId = CreatureParser.ParseCreature(msg, peek, _world);
             var tile = _world.GetOrCreateTile(x, y, z);
-            tile.AddCreature(creatureId);
+            tile.AddCreature(creatureId, stackpos);
             var creature = _world.GetCreature(creatureId);
             creature?.UpdatePosition(x, y, z);
 
@@ -343,10 +371,7 @@ public sealed class Protocol860Parser
                 msg.GetU8();
 
             var tile = _world.GetOrCreateTile(x, y, z);
-            if (stackpos == 0)
-                tile.GroundId = clientId;
-            else
-                tile.ItemIds.Add(clientId);
+            tile.AddItem(clientId, stackpos);
         }
     }
 
@@ -372,6 +397,9 @@ public sealed class Protocol860Parser
             ushort clientId = msg.GetU16();
             if (MapParser.IsKnownStackableOrFluid(clientId) && msg.Remaining > 0)
                 msg.GetU8();
+            var tile = _world.GetOrCreateTile(x, y, z);
+            tile.RemoveThing(stackpos);
+            tile.AddItem(clientId, stackpos);
         }
     }
 
@@ -380,9 +408,8 @@ public sealed class Protocol860Parser
         var (x, y, z) = msg.GetPosition();
         byte stackpos = msg.GetU8();
 
-        // We can't easily know if the removed thing was a creature or item
-        // without maintaining a full per-tile stack. For now, we let creature
-        // tracking update via movement/disappear packets.
+        uint removed = _world.GetTile(x, y, z)?.RemoveThing(stackpos) ?? 0;
+        if (removed != 0) _world.RemoveCreature(removed);
     }
 
     private void ParseMoveCreature(InputMessage msg)
@@ -395,30 +422,8 @@ public sealed class Protocol860Parser
         var oldTile = _world.GetTile(oldX, oldY, oldZ);
         uint movedCreatureId = 0;
 
-        if (oldTile != null && oldStackpos < oldTile.CreatureIds.Count + oldTile.ItemIds.Count + 1)
-        {
-            // Try to identify the creature from the tile's creature list
-            // stackpos counting: ground(0), topItems, creatures, bottomItems
-            // Without full stack tracking, we try the first creature on the tile
-            if (oldTile.CreatureIds.Count > 0)
-            {
-                // Simple heuristic: if only one creature, it must be it
-                if (oldTile.CreatureIds.Count == 1)
-                {
-                    movedCreatureId = oldTile.CreatureIds[0];
-                }
-                else
-                {
-                    // Try to match by stackpos accounting
-                    int creatureIndex = oldStackpos - 1 - oldTile.ItemIds.Count;
-                    if (oldTile.GroundId != 0) creatureIndex--;
-                    if (creatureIndex >= 0 && creatureIndex < oldTile.CreatureIds.Count)
-                        movedCreatureId = oldTile.CreatureIds[creatureIndex];
-                    else if (oldTile.CreatureIds.Count > 0)
-                        movedCreatureId = oldTile.CreatureIds[0]; // fallback
-                }
-            }
-        }
+        if (oldTile != null && oldStackpos < oldTile.Things.Count)
+            movedCreatureId = oldTile.Things[oldStackpos].CreatureId;
 
         if (movedCreatureId != 0)
         {
@@ -426,6 +431,7 @@ public sealed class Protocol860Parser
 
             if (movedCreatureId == _world.Player.Id)
             {
+                _playerMovedFrom = (oldX, oldY, oldZ);
                 _world.Player.UpdatePosition(newX, newY, newZ);
             }
         }
@@ -492,7 +498,10 @@ public sealed class Protocol860Parser
     private void ParseFloorChange(InputMessage msg, byte opcode)
     {
         var p = _world.Player;
-        byte oldZ = p.Z;
+        var origin = _playerMovedFrom ?? (p.X, p.Y, p.Z);
+        byte oldZ = origin.Item3;
+        _playerMovedFrom = null;
+        int skip = 0;
 
         if (opcode == ServerOpcodes.FloorUp) // 0xBE
         {
@@ -506,20 +515,16 @@ public sealed class Protocol860Parser
                 {
                     int offset = 8 - i;
                     MapParser.ParseFloorDescription(msg, _world,
-                        p.X - 8, p.Y - 6, (byte)i, 18, 14, offset);
+                        origin.Item1 - 8, origin.Item2 - 6, (byte)i, 18, 14, offset, ref skip);
                 }
-                SkipTrailingSkip(msg);
             }
             else if (newZ > 7) // still underground
             {
                 MapParser.ParseFloorDescription(msg, _world,
-                    p.X - 8, p.Y - 6, (byte)(oldZ - 3), 18, 14, 3);
-                SkipTrailingSkip(msg);
+                    origin.Item1 - 8, origin.Item2 - 6, (byte)(oldZ - 3), 18, 14, 3, ref skip);
             }
 
-            // West strip + North strip to fix sync
-            MapParser.ParseMapSlice(msg, _world, p.X - 8, p.Y - 5, newZ, 1, 14);
-            MapParser.ParseMapSlice(msg, _world, p.X - 8, p.Y - 6, newZ, 18, 1);
+            // West/north strips have their own opcodes; let the outer loop consume them.
         }
         else // 0xBF = FloorDown
         {
@@ -531,21 +536,18 @@ public sealed class Protocol860Parser
                 for (int i = 0; i < 3; i++)
                 {
                     MapParser.ParseFloorDescription(msg, _world,
-                        p.X - 8, p.Y - 6, (byte)(newZ + i), 18, 14, -i - 1);
+                        origin.Item1 - 8, origin.Item2 - 6, (byte)(newZ + i), 18, 14, -i - 1, ref skip);
                 }
-                SkipTrailingSkip(msg);
             }
             else if (newZ > 8 && newZ < 14) // deeper underground
             {
                 MapParser.ParseFloorDescription(msg, _world,
-                    p.X - 8, p.Y - 6, (byte)(newZ + 2), 18, 14, -3);
-                SkipTrailingSkip(msg);
+                    origin.Item1 - 8, origin.Item2 - 6, (byte)(newZ + 2), 18, 14, -3, ref skip);
             }
 
-            // East strip + South strip to fix sync
-            MapParser.ParseMapSlice(msg, _world, p.X + 9, p.Y - 7, newZ, 1, 14);
-            MapParser.ParseMapSlice(msg, _world, p.X - 8, p.Y + 7, newZ, 18, 1);
+            // East/south strips have their own opcodes.
         }
+        if (skip != 0) throw new InvalidDataException("Floor-change skip exceeds its visible floors.");
     }
 
     private void ParseOutfitWindow(InputMessage msg)
@@ -563,7 +565,7 @@ public sealed class Protocol860Parser
         msg.GetU16(); // current mount
 
         // Available outfits
-        int outfitCount = msg.GetU8();
+        int outfitCount = msg.GetU16(); // This fork uses u16 for non-OTC OS 2 clients.
         var outfits = new List<(ushort LookType, string Name, byte Addons)>(outfitCount);
         for (int i = 0; i < outfitCount; i++)
         {
@@ -668,7 +670,7 @@ public sealed class Protocol860Parser
             case 4: // PRIVATE_PN
             case 11: // PRIVATE_RED
                 break;
-            // Other types have no extra data
+                // Other types have no extra data
         }
 
         msg.GetString(); // message text

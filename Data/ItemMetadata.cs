@@ -31,7 +31,7 @@ public sealed class ItemMetadata
 
     public static bool IsBlocking(ushort clientId)
     {
-        return _knownBlockingItems.Contains(clientId);
+        return ItemCatalog.Current?.Get(clientId).Blocking ?? _knownBlockingItems.Contains(clientId);
     }
 
     public static bool IsStairsOrLadder(ushort clientId)

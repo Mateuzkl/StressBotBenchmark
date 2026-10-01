@@ -105,7 +105,10 @@ public sealed class WorldState
         oldTile?.RemoveCreature(creatureId);
 
         var newTile = GetOrCreateTile(newX, newY, newZ);
-        newTile.AddCreature(creatureId);
+        int index = newTile.Things.FindIndex(t => t.CreatureId != 0 ||
+            (t.ItemId != 0 && !(Data.ItemCatalog.Current?.Get(t.ItemId).Ground ?? false) &&
+             !(Data.ItemCatalog.Current?.Get(t.ItemId).OnTop ?? false)));
+        newTile.AddCreature(creatureId, index < 0 ? newTile.Things.Count : index);
 
         if (_creatures.TryGetValue(creatureId, out var c))
         {
