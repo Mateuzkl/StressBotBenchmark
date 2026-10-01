@@ -18,6 +18,11 @@ namespace StressBotBenchmark
         private readonly uint[] _xteaKey = new uint[4];
         private readonly CancellationTokenSource _stop = new();
         private readonly SemaphoreSlim _writeLock = new(1, 1);
+        private readonly SemaphoreSlim _sendSlots;
+        private readonly int _seed;
+        private readonly object _worldLock = new();
+        private bool _pendingPing;
+        private int _activityState;
         private TcpClient? _client;
         private NetworkStream? _stream;
         private volatile bool _inWorld;
@@ -35,11 +40,6 @@ namespace StressBotBenchmark
         private Protocol860Parser? _parser;
         private BotBrain? _brain;
 
-        // Legacy compat — kept for dashboard until Phase 7 upgrades metrics
-        private readonly List<uint> _recentMonsters = new();
-        private readonly HashSet<uint> _allSeenMonsters = new();
-        private readonly object _monsterLock = new();
-
         public TibiaBot(string name, string password, BotConfig config, BotMetrics metrics,
                         ConnectionPacer connectionPacer)
         {
@@ -48,6 +48,8 @@ namespace StressBotBenchmark
             _config = config;
             _metrics = metrics;
             _connectionPacer = connectionPacer;
+            _sendSlots = new SemaphoreSlim(config.QueueSize, config.QueueSize);
+            _seed = StableSeed.For(name, config.RandomSeed ?? Environment.TickCount);
         }
 
         public string Name => _name;
@@ -61,10 +63,9 @@ namespace StressBotBenchmark
         public DateTime LastSpellTime { get; private set; } = DateTime.MinValue;
         public DateTime LastAttackTime { get; private set; } = DateTime.MinValue;
         public DateTime LastDamageTakenTime { get; private set; } = DateTime.MinValue;
-        public int TrackedMonstersTotal => _worldState.CountVisibleMonsters();
-
-        /// <summary>Structured world state for AI and dashboard access.</summary>
-        public WorldState World => _worldState;
+        public int TrackedMonstersTotal { get { lock (_worldLock) return _worldState.CountVisibleMonsters(); } }
+        public ActivityState Activity => (ActivityState)Volatile.Read(ref _activityState);
+        private Random Rng(int stream) => new(StableSeed.For(_name, _seed, stream));
 
         public async Task StartAsync(CancellationToken cancellationToken = default)
         {
@@ -75,6 +76,7 @@ namespace StressBotBenchmark
             var token = lifetime.Token;
             int failures = 0;
             bool retry = false;
+            var retryRng = Rng(1);
             try
             {
                 while (!token.IsCancellationRequested)
@@ -104,7 +106,7 @@ namespace StressBotBenchmark
                         retryDelayMs = Math.Min(2000 * (1 << (failures - 1)), 30000);
                         if (error is LoginWaitException waiting)
                             retryDelayMs = Math.Max(retryDelayMs, waiting.RetrySeconds * 1000);
-                        retryDelayMs += Random.Shared.Next(500, 1500);
+                        retryDelayMs += retryRng.Next(500, 1500);
                         retry = true;
                     }
                     finally { CleanupConnection(); }
@@ -120,6 +122,7 @@ namespace StressBotBenchmark
                 CleanupConnection();
                 // Run owns these resources; no writer survives ConnectAndRunAsync.
                 _writeLock.Dispose();
+                _sendSlots.Dispose();
                 _stop.Dispose();
             }
         }
@@ -143,6 +146,7 @@ namespace StressBotBenchmark
             if (Volatile.Read(ref _started) == 0)
             {
                 _writeLock.Dispose();
+                _sendSlots.Dispose();
                 _stop.Dispose();
             }
         }
@@ -163,11 +167,10 @@ namespace StressBotBenchmark
             _client = null;
             _fightModesSent = false;
             _parser = null;
-            _worldState.Clear();
-            lock (_monsterLock)
+            lock (_worldLock)
             {
-                _recentMonsters.Clear();
-                _allSeenMonsters.Clear();
+                _worldState.Clear();
+                _pendingPing = false;
             }
         }
 
@@ -187,7 +190,8 @@ namespace StressBotBenchmark
 
             // Create structured parser for this session
             _parser = new Protocol860Parser(_worldState, _metrics);
-            _parser.OnPingReceived = async () => await SendPingBackAsync(token);
+            // The read loop awaits replies after parsing; no unowned async-void writers.
+            _parser.OnPingReceived = () => _pendingPing = true;
             _parser.OnLoginAck = () => { _inWorld = true; };
             _parser.OnDisconnect = msg => throw new IOException(msg);
             _parser.OnDisconnectWait = (msg, retry) => throw new LoginWaitException(msg, retry);
@@ -212,10 +216,15 @@ namespace StressBotBenchmark
                     await ProcessEncryptedPacketAsync(await ReadMessageAsync(handshake.Token), handshake.Token);
             }
 
-            var tasks = new List<Task> { ReadLoopAsync(token), KeepAliveLoopAsync(token), IdleTurnLoopAsync(token) };
-            if (!_config.LoginOnly)
+            var tasks = new List<Task> { ReadLoopAsync(token) };
+            bool loginOnly = _config.EffectiveWorkloadMode == WorkloadMode.LOGIN_ONLY;
+            if (_config.KeepAliveIntervalMs > 0 && (!loginOnly || _config.LoginOnlyKeepAliveEnabled))
+                tasks.Add(KeepAliveLoopAsync(token));
+            if (_config.IdleTurnIntervalMs > 0 && (!loginOnly || _config.LoginOnlyIdleTurnEnabled))
+                tasks.Add(IdleTurnLoopAsync(token));
+            if (!loginOnly)
             {
-                if (_config.AiEnabled)
+                if (_config.AiEnabled || _config.EffectiveWorkloadMode == WorkloadMode.REALISTIC)
                 {
                     tasks.Add(BrainLoopAsync(token));
                 }
@@ -312,50 +321,27 @@ namespace StressBotBenchmark
             await ProcessPayloadAsync(new InputMessage(encrypted, 2, length + 2), token);
         }
 
-        private Task ProcessPayloadAsync(InputMessage payload, CancellationToken token)
+        private async Task ProcessPayloadAsync(InputMessage payload, CancellationToken token)
         {
-            if (_parser == null) return Task.CompletedTask;
-
-            bool becameInWorld = _parser.ProcessPayload(payload, _inWorld);
-            if (becameInWorld)
+            if (_parser == null) return;
+            bool reply;
+            lock (_worldLock)
             {
-                _inWorld = true;
+                if (_parser.ProcessPayload(payload, _inWorld)) _inWorld = true;
+                var p = _worldState.Player;
+                if (p.MaxHp > 0) Stats = new PlayerStats(p.Hp, p.MaxHp, p.Mana, p.MaxMana, p.Level);
+                if (p.LastDamageTakenTime > LastDamageTakenTime) LastDamageTakenTime = p.LastDamageTakenTime;
+                reply = _pendingPing;
+                _pendingPing = false;
             }
-
-            // Sync legacy Stats property from world state for backward compat
-            var p = _worldState.Player;
-            if (p.MaxHp > 0)
-            {
-                Stats = new PlayerStats(p.Hp, p.MaxHp, p.Mana, p.MaxMana, p.Level);
-            }
-
-            // Sync damage time from world state
-            if (p.LastDamageTakenTime > LastDamageTakenTime)
-                LastDamageTakenTime = p.LastDamageTakenTime;
-
-            // Populate legacy monster lists from WorldState for backward compat
-            if (_config.EnableAttack)
-            {
-                lock (_monsterLock)
-                {
-                    foreach (var creature in _worldState.GetVisibleMonsters())
-                    {
-                        _allSeenMonsters.Add(creature.Id);
-                        if (!_recentMonsters.Contains(creature.Id))
-                        {
-                            _recentMonsters.Add(creature.Id);
-                            if (_recentMonsters.Count > 10) _recentMonsters.RemoveAt(0);
-                        }
-                    }
-                }
-            }
-
-            return Task.CompletedTask;
+            // A server-requested reply is essential even in LOGIN_ONLY mode.
+            if (reply) await SendPingBackAsync(token, required: true);
         }
 
         private async Task KeepAliveLoopAsync(CancellationToken token)
         {
-            await Task.Delay(Random.Shared.Next(200, 1000), token);
+            var rng = Rng(2);
+            await Task.Delay(rng.Next(200, 1000), token);
             while (!token.IsCancellationRequested)
             {
                 if (_inWorld) await SendPingBackAsync(token);
@@ -365,49 +351,76 @@ namespace StressBotBenchmark
 
         private async Task IdleTurnLoopAsync(CancellationToken token)
         {
+            var rng = Rng(3);
             if (_config.IdleTurnIntervalMs <= 0) { await Task.Delay(Timeout.Infinite, token); return; }
             while (!token.IsCancellationRequested)
             {
                 await Task.Delay(TimeSpan.FromMilliseconds(
-                    _config.IdleTurnIntervalMs * (0.9 + Random.Shared.NextDouble() * 0.2)), token);
+                    _config.IdleTurnIntervalMs * (0.9 + rng.NextDouble() * 0.2)), token);
                 if (!_inWorld) continue;
                 var message = new OutputMessage();
-                message.AddU8((byte)(0x6F + Random.Shared.Next(4)));
+                message.AddU8((byte)(0x6F + rng.Next(4)));
                 await SendRawGameMessageAsync(message, token);
-                _metrics.IncTurns();
             }
         }
 
-        private async Task SendPingBackAsync(CancellationToken token)
+        private async Task SendPingBackAsync(CancellationToken token, bool required = false)
         {
             var message = new OutputMessage();
             message.AddU8(0x1E);
-            await SendRawGameMessageAsync(message, token, isPing: true);
+            await SendRawGameMessageAsync(message, token, isPing: true, requiredPing: required);
         }
 
-        private async Task SendRawGameMessageAsync(OutputMessage message, CancellationToken token, bool isPing = false)
+        private async Task<bool> SendRawGameMessageAsync(OutputMessage message, CancellationToken token,
+                                                       bool isPing = false, bool requiredPing = false)
         {
             var payload = message.GetBuffer();
             byte[] padded = new byte[(payload.Length + 2 + 7) / 8 * 8];
             BitConverter.TryWriteBytes(padded.AsSpan(), (ushort)payload.Length);
             payload.CopyTo(padded, 2);
             Xtea.Encrypt(padded, _xteaKey);
-            await WritePacketAsync(WrapChecksum(padded), token, isPing);
+            bool sent = await WritePacketAsync(WrapChecksum(padded), token, isPing, requiredPing,
+                ActionClassifier.IsReplaceable(payload));
+            if (sent) RecordAction(payload);
+            return sent;
         }
 
-        private async Task WritePacketAsync(byte[] packet, CancellationToken token, bool isPing = false)
+        private async Task<bool> WritePacketAsync(byte[] packet, CancellationToken token, bool isPing = false,
+                                                 bool requiredPing = false, bool replaceable = false)
         {
             long queued = Stopwatch.GetTimestamp();
-            await _writeLock.WaitAsync(token);
+            if (replaceable && !_sendSlots.Wait(0))
+            {
+                _metrics.IncQueueFull();
+                _metrics.IncDropped();
+                return false;
+            }
+            bool locked = false;
             try
             {
-                if (isPing && _lastPing != 0 && Stopwatch.GetElapsedTime(_lastPing).TotalMilliseconds < 1000)
-                    return;
+                _metrics.IncEnqueued();
+                using var ageLimit = CancellationTokenSource.CreateLinkedTokenSource(token);
+                if (replaceable) ageLimit.CancelAfter(_config.MaxSendLagMsToDrop);
+                try { await _writeLock.WaitAsync(ageLimit.Token); }
+                catch (OperationCanceledException) when (!token.IsCancellationRequested && replaceable)
+                {
+                    _metrics.IncDropped();
+                    return false;
+                }
+                locked = true;
+                if (isPing && !requiredPing && _lastPing != 0 &&
+                    Stopwatch.GetElapsedTime(_lastPing).TotalMilliseconds < _config.PingbackMinIntervalMs)
+                    return false;
                 // Bound all writes, including heartbeats and actions, below TFS's 25 pps.
                 if (_lastSend != 0)
                 {
-                    double remaining = 55 - Stopwatch.GetElapsedTime(_lastSend).TotalMilliseconds;
+                    double remaining = 1000 / _config.MaxPacketsPerSecondPerBot - Stopwatch.GetElapsedTime(_lastSend).TotalMilliseconds;
                     if (remaining > 0) await Task.Delay(TimeSpan.FromMilliseconds(remaining), token);
+                }
+                if (replaceable && Stopwatch.GetElapsedTime(queued).TotalMilliseconds >= _config.MaxSendLagMsToDrop)
+                {
+                    _metrics.IncDropped();
+                    return false;
                 }
                 _metrics.AddQueueWaitMs(Stopwatch.GetElapsedTime(queued).TotalMilliseconds);
                 var stream = _stream ?? throw new IOException("Stream is closed.");
@@ -424,8 +437,29 @@ namespace StressBotBenchmark
                     _lastPing = _lastSend;
                     _metrics.IncPingbacks();
                 }
+                return true;
             }
-            finally { _writeLock.Release(); }
+            finally
+            {
+                if (locked) _writeLock.Release();
+                if (replaceable) _sendSlots.Release();
+            }
+        }
+
+        private void RecordAction(byte[] payload)
+        {
+            var now = DateTime.UtcNow;
+            switch (ActionClassifier.Classify(payload, _config))
+            {
+                case ActionKind.Walk: _metrics.IncWalks(); LastWalkTime = now; break;
+                case ActionKind.Attack: _metrics.IncAttacks(); LastAttackTime = now; break;
+                case ActionKind.Spell: _metrics.IncSpells(); LastSpellTime = now; break;
+                case ActionKind.Heal: _metrics.IncHeals(); LastSpellTime = now; break;
+                case ActionKind.Potion: _metrics.IncPotions(); break;
+                case ActionKind.Chat: _metrics.IncChats(); break;
+                case ActionKind.Turn: _metrics.IncTurns(); break;
+                case ActionKind.Outfit: _metrics.IncOutfits(); break;
+            }
         }
 
         private static byte[] WrapChecksum(byte[] payload)
@@ -452,7 +486,7 @@ namespace StressBotBenchmark
         private async Task WalkLoopAsync(CancellationToken token)
         {
             if (!_config.EnableRandomWalk) { await Task.Delay(-1, token); return; }
-            var rand = new Random();
+            var rand = Rng(4);
             byte[] walks = { 0x65, 0x66, 0x67, 0x68 };
             await Task.Delay(rand.Next(100, 3000), token); // Initial spawn spread
 
@@ -464,12 +498,10 @@ namespace StressBotBenchmark
 
                 // Only pause random wandering if ChaseMode is ENFORCED AND we are actively fighting!
                 if (_config.EnableChaseMode && (DateTime.UtcNow - LastAttackTime).TotalSeconds < 5) continue;
-                
+
                 var msg = new OutputMessage();
                 msg.AddU8(walks[rand.Next(walks.Length)]);
                 await SendRawGameMessageAsync(msg, token);
-                _metrics.IncWalks();
-                LastWalkTime = DateTime.UtcNow;
             }
         }
 
@@ -484,7 +516,7 @@ namespace StressBotBenchmark
         private async Task ChatLoopAsync(CancellationToken token)
         {
             if (!_config.EnableChat) { await Task.Delay(-1, token); return; }
-            Random rand = new Random();
+            Random rand = Rng(5);
             await Task.Delay(rand.Next(5000, 30000), token); // Long initial delay
 
             while (!token.IsCancellationRequested)
@@ -504,7 +536,6 @@ namespace StressBotBenchmark
                 msg.AddU8(1);    // SAY
                 msg.AddString(text);
                 await SendRawGameMessageAsync(msg, token);
-                _metrics.IncChats();
             }
         }
 
@@ -522,7 +553,7 @@ namespace StressBotBenchmark
                 slots = new[] { new SpellSlot { Enabled = true, SpellText = _config.SpellText, IntervalMs = (int)_config.SpellIntervalMs } };
             }
 
-            var rand = new Random();
+            var rand = Rng(6);
             var lastCast = new DateTime[slots.Length];
             await Task.Delay(rand.Next(500, 3000), token);
 
@@ -533,16 +564,16 @@ namespace StressBotBenchmark
 
                 // ── RULE: Only cast offensive spells when there is a VALID target ──
                 // Check WorldState for a valid target first
-                uint currentTarget = _worldState.Player.CurrentTargetId;
                 bool hasValidTarget = false;
-
-                if (currentTarget != 0)
+                double manaPercent;
+                lock (_worldLock)
                 {
-                    var target = _worldState.GetCreature(currentTarget);
+                    var target = _worldState.GetCreature(_worldState.Player.CurrentTargetId);
                     hasValidTarget = target != null &&
                                      target.Visible &&
                                      target.HealthPercent > 0 &&
                                      target.Z == _worldState.Player.Z;
+                    manaPercent = _worldState.Player.ManaPercent;
                 }
 
                 // Also check if we recently sent an attack (fallback for when
@@ -551,7 +582,6 @@ namespace StressBotBenchmark
                     continue; // No target, no spell
 
                 // Check mana availability from WorldState
-                double manaPercent = _worldState.Player.ManaPercent;
 
                 for (int i = 0; i < slots.Length; i++)
                 {
@@ -566,7 +596,6 @@ namespace StressBotBenchmark
                     msg.AddU8(1);
                     msg.AddString(slot.SpellText);
                     await SendRawGameMessageAsync(msg, token);
-                    _metrics.IncSpells();
                     lastCast[i] = DateTime.UtcNow;
                     LastSpellTime = DateTime.UtcNow;
                     break; // uma spell por tick para não spammar
@@ -582,7 +611,7 @@ namespace StressBotBenchmark
         private async Task AttackLoopAsync(CancellationToken token)
         {
             if (!_config.EnableAttack) { await Task.Delay(-1, token); return; }
-            Random rand = new Random();
+            Random rand = Rng(7);
             await Task.Delay(rand.Next(1000, 4000), token);
 
             while (!token.IsCancellationRequested)
@@ -604,45 +633,48 @@ namespace StressBotBenchmark
 
                 // ── TARGET VALIDATION ──
                 // Check if current target is still valid
-                bool targetValid = false;
-                if (_currentAttackTarget != 0)
+                lock (_worldLock)
                 {
-                    var target = _worldState.GetCreature(_currentAttackTarget);
-                    targetValid = target != null &&
-                                  target.Visible &&
-                                  target.HealthPercent > 0 &&
-                                  target.Z == _worldState.Player.Z &&
-                                  target.Type == CreatureType.Monster;
-                }
-
-                // ── TARGET ACQUISITION ──
-                // If no valid target, find the best one from WorldState
-                if (!targetValid)
-                {
-                    _currentAttackTarget = 0;
-                    _worldState.Player.CurrentTargetId = 0;
-
-                    // Find closest visible monster on same floor with HP > 0
-                    uint bestId = 0;
-                    int bestDist = int.MaxValue;
-                    var px = _worldState.Player.X;
-                    var py = _worldState.Player.Y;
-
-                    foreach (var monster in _worldState.GetVisibleMonsters())
+                    bool targetValid = false;
+                    if (_currentAttackTarget != 0)
                     {
-                        int dist = monster.ChebyshevDistanceTo(px, py);
-                        if (dist < bestDist)
-                        {
-                            bestDist = dist;
-                            bestId = monster.Id;
-                        }
+                        var target = _worldState.GetCreature(_currentAttackTarget);
+                        targetValid = target != null &&
+                                      target.Visible &&
+                                      target.HealthPercent > 0 &&
+                                      target.Z == _worldState.Player.Z &&
+                                      target.Type == CreatureType.Monster;
                     }
 
-                    if (bestId != 0)
+                    // ── TARGET ACQUISITION ──
+                    // If no valid target, find the best one from WorldState
+                    if (!targetValid)
                     {
-                        _currentAttackTarget = bestId;
-                        _worldState.Player.CurrentTargetId = bestId;
-                        _targetAcquiredTime = DateTime.UtcNow;
+                        _currentAttackTarget = 0;
+                        _worldState.Player.CurrentTargetId = 0;
+
+                        // Find closest visible monster on same floor with HP > 0
+                        uint bestId = 0;
+                        int bestDist = int.MaxValue;
+                        var px = _worldState.Player.X;
+                        var py = _worldState.Player.Y;
+
+                        foreach (var monster in _worldState.GetVisibleMonsters())
+                        {
+                            int dist = monster.ChebyshevDistanceTo(px, py);
+                            if (dist < bestDist)
+                            {
+                                bestDist = dist;
+                                bestId = monster.Id;
+                            }
+                        }
+
+                        if (bestId != 0)
+                        {
+                            _currentAttackTarget = bestId;
+                            _worldState.Player.CurrentTargetId = bestId;
+                            _targetAcquiredTime = DateTime.UtcNow;
+                        }
                     }
                 }
 
@@ -651,8 +683,6 @@ namespace StressBotBenchmark
                 {
                     var attackMsg = Protocol860Writer.Attack(_currentAttackTarget);
                     await SendRawGameMessageAsync(attackMsg, token);
-                    _metrics.IncAttacks();
-                    LastAttackTime = DateTime.UtcNow;
                     _lastAttackSentTime = DateTime.UtcNow;
                 }
             }
@@ -660,51 +690,27 @@ namespace StressBotBenchmark
 
         private async Task BrainLoopAsync(CancellationToken token)
         {
-            int seed = _config.RandomSeed.HasValue
-                ? _config.RandomSeed.Value ^ _name.GetHashCode()
-                : _name.GetHashCode() ^ Environment.TickCount;
-
-            _brain = new BotBrain(_worldState, _config, seed);
-
-            var rng = new Random(seed);
+            _brain = new BotBrain(_worldState, _config, _seed);
+            var rng = Rng(8);
             // Stagger initial start so bots don't all tick on the exact same millisecond
             await Task.Delay(rng.Next(200, 1500), token);
 
             while (!token.IsCancellationRequested)
             {
-                // Tick interval: 150-250ms + light jitter
-                int jitter = rng.Next(-25, 26);
-                await Task.Delay(200 + jitter, token);
+                await Task.Delay(rng.Next(_config.EffectiveAiTickMinMs, _config.EffectiveAiTickMaxMs + 1), token);
 
                 if (!_inWorld) continue;
 
-                var actionMsg = _brain.Tick();
+                OutputMessage? actionMsg;
+                lock (_worldLock)
+                {
+                    actionMsg = _brain.Tick();
+                    Volatile.Write(ref _activityState, (int)_brain.ActivityState);
+                }
                 if (actionMsg != null)
                 {
-                    await SendRawGameMessageAsync(actionMsg, token);
-
-                    // Track metrics based on action sent
-                    byte opcode = actionMsg.GetBuffer()[0];
-                    if (opcode >= 0x65 && opcode <= 0x6D)
-                    {
-                        _metrics.IncWalks();
-                        LastWalkTime = DateTime.UtcNow;
-                    }
-                    else if (opcode == 0x64) // autowalk
-                    {
-                        _metrics.IncWalks();
-                        LastWalkTime = DateTime.UtcNow;
-                    }
-                    else if (opcode == 0xA1) // attack
-                    {
-                        _metrics.IncAttacks();
-                        LastAttackTime = DateTime.UtcNow;
-                    }
-                    else if (opcode == 0x96) // say (spell, heal, or chat)
-                    {
-                        _metrics.IncSpells();
-                        LastSpellTime = DateTime.UtcNow;
-                    }
+                    if (!await SendRawGameMessageAsync(actionMsg, token))
+                        lock (_worldLock) _brain.OnActionDropped();
                 }
             }
         }

@@ -1,0 +1,18 @@
+{
+  "workloadMode": "TORTURE",
+  "botCount": 100,
+  "randomSeed": 180252,
+  "enableRandomWalk": true,
+  "walkIntervalMs": 300,
+  "enableAttack": true,
+  "attackScanIntervalMs": 500,
+  "enableChat": true,
+  "chatIntervalMs": 5000,
+  "maxPacketsPerSecondPerBot": 20,
+  "aiTickIntervalMinMs": 175,
+  "aiTickIntervalMaxMs": 225,
+  "vocationConfig": {
+    "vocation": "Knight",
+    "spell1": { "enabled": true, "spellText": "exori", "intervalMs": 4000, "minManaPercent": 25 }
+  }
+}

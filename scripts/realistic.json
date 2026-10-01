@@ -1,0 +1,21 @@
+{
+  "workloadMode": "REALISTIC",
+  "botCount": 100,
+  "randomSeed": 180252,
+  "enableRandomWalk": true,
+  "walkIntervalMs": 1500,
+  "enableAttack": true,
+  "attackScanIntervalMs": 2000,
+  "enableChat": true,
+  "chatIntervalMs": 30000,
+  "enableOutfit": false,
+  "maxPacketsPerSecondPerBot": 18,
+  "aiTickIntervalMinMs": 500,
+  "aiTickIntervalMaxMs": 1000,
+  "activityWeights": { "idle": 35, "walking": 30, "combat": 28, "social": 7 },
+  "vocationConfig": {
+    "vocation": "Knight",
+    "heal1": { "enabled": true, "spellText": "exura ico", "thresholdPercent": 65, "cooldownMs": 2000 },
+    "spell1": { "enabled": true, "spellText": "exori", "intervalMs": 4000, "minManaPercent": 25 }
+  }
+}

@@ -13,6 +13,11 @@ namespace StressBotBenchmark
     {
         static async Task Main(string[] args)
         {
+            if (args.Contains("--self-test"))
+            {
+                SelfTests.Run();
+                return;
+            }
             AnsiConsole.Write(new FigletText("StressBot 8.60").Color(Color.Yellow));
             AnsiConsole.MarkupLine("[grey]Tibia 8.60 StressBot Cluster - Console Edition[/]\n");
 
@@ -47,6 +52,13 @@ namespace StressBotBenchmark
                 {
                     if (arg.StartsWith("--bots=")) config.BotCount = int.Parse(arg[7..], CultureInfo.InvariantCulture);
                     else if (arg == "--login-only") config.LoginOnly = true;
+                    else if (arg.StartsWith("--mode="))
+                    {
+                        config.WorkloadMode = Enum.Parse<WorkloadMode>(arg[7..], ignoreCase: true);
+                        config.LoginOnly = false;
+                    }
+                    else if (arg.StartsWith("--seed=")) config.RandomSeed = int.Parse(arg[7..], CultureInfo.InvariantCulture);
+                    else if (arg.StartsWith("--items-otb=")) config.ItemsOtbPath = arg[12..];
                     else if (arg.StartsWith("--duration="))
                     {
                         string value = arg[11..];
@@ -59,10 +71,17 @@ namespace StressBotBenchmark
                     string.IsNullOrWhiteSpace(config.Host) || string.IsNullOrWhiteSpace(config.Prefix) ||
                     config.Port < 1 || config.Port > 65535 ||
                     !double.IsFinite(config.LoginDelayMs) || config.LoginDelayMs < 0 || config.LoginDelayMs > 60000 ||
-                    !double.IsFinite(config.KeepAliveIntervalMs) || config.KeepAliveIntervalMs < 1000 || config.KeepAliveIntervalMs > 5000 ||
+                    !double.IsFinite(config.KeepAliveIntervalMs) || (config.KeepAliveIntervalMs != 0 && config.KeepAliveIntervalMs < 1000) || config.KeepAliveIntervalMs > 5000 ||
                     !double.IsFinite(config.IdleTurnIntervalMs) || config.IdleTurnIntervalMs < 0 || config.IdleTurnIntervalMs > 600000 ||
                     !double.IsFinite(config.DashboardIntervalMs) || config.DashboardIntervalMs < 100 || config.DashboardIntervalMs > 60000 ||
-                    !double.IsFinite(durationSeconds) || durationSeconds < 0 || durationSeconds > 86400 * 7)
+                    !double.IsFinite(durationSeconds) || durationSeconds < 0 || durationSeconds > 86400 * 7 ||
+                    !Enum.IsDefined(config.WorkloadMode) || config.QueueSize < 1 || config.QueueSize > 1024 ||
+                    config.MaxSendLagMsToDrop < 1 || config.MaxSendLagMsToDrop > 60000 ||
+                    !double.IsFinite(config.MaxPacketsPerSecondPerBot) || config.MaxPacketsPerSecondPerBot < 1 || config.MaxPacketsPerSecondPerBot > 20 ||
+                    config.EffectiveAiTickMinMs < 50 || config.EffectiveAiTickMaxMs < config.EffectiveAiTickMinMs || config.EffectiveAiTickMaxMs > 60000 ||
+                    !double.IsFinite(config.PingbackMinIntervalMs) || config.PingbackMinIntervalMs < 0 || config.PingbackMinIntervalMs > 60000 ||
+                    new[] { config.WalkIntervalMs, config.AttackScanIntervalMs, config.ChatIntervalMs, config.SpellIntervalMs }
+                        .Any(ms => !double.IsFinite(ms) || ms < 1 || ms > 600000))
                     throw new ArgumentException("Configuração inválida: bots 1–1000, ping 1000–5000 ms e intervalos válidos são necessários.");
             }
             catch (Exception error) when (error is ArgumentException or FormatException or OverflowException)
@@ -72,14 +91,28 @@ namespace StressBotBenchmark
                 return;
             }
 
-            // Old saved scripts may still request 100 ms bursts. Apply the same
-            // minimum to every TCP attempt, including all retries.
-            config.LoginDelayMs = Math.Max(650, config.LoginDelayMs);
-            if (config.LoginOnly)
+            if (config.LoginDelayMs < 650)
+                AnsiConsole.MarkupLine("[yellow]Login rápido: use somente em servidor privado com rate limit compatível.[/]");
+            if (config.EffectiveWorkloadMode == WorkloadMode.LOGIN_ONLY)
             {
                 config.EnableAttack = config.EnableRandomWalk = config.EnableChat = config.EnableSpell = false;
             }
             ShowConfigSummary(config);
+            AnsiConsole.MarkupLine($"[grey]Mode: {config.EffectiveWorkloadMode}; seed: {config.RandomSeed?.ToString() ?? "random"}; AI tick: {config.EffectiveAiTickMinMs}–{config.EffectiveAiTickMaxMs} ms; packet cap: {config.MaxPacketsPerSecondPerBot}/s/bot.[/]");
+            try
+            {
+                _ = new AI.WorkloadSchedule(config.ActivityWeights, 0);
+                if (!string.IsNullOrWhiteSpace(config.ItemsOtbPath)) Data.ItemCatalog.Load(config.ItemsOtbPath);
+            }
+            catch (Exception error) when (error is IOException or ArgumentException)
+            {
+                Console.Error.WriteLine(error.Message);
+                Environment.ExitCode = 2;
+                return;
+            }
+            if (Data.ItemCatalog.Current == null)
+                AnsiConsole.MarkupLine("[yellow]Sem itemsOtbPath: parsing de itens é heurístico; resultados não validam mapas com itens customizados.[/]");
+            else AnsiConsole.MarkupLine($"[grey]OTB metadata: {Data.ItemCatalog.Current.Count} items.[/]");
             AnsiConsole.MarkupLine($"[grey]Intervalo global: {config.LoginDelayMs:F0} ms. Subida mínima: {(config.BotCount - 1) * config.LoginDelayMs / 60000:F1} min. Ctrl+C encerra.[/]");
             if (args.Contains("--check-config")) return;
 
@@ -304,7 +337,7 @@ namespace StressBotBenchmark
             table.AddRow("Bots", $"{c.BotCount}");
             table.AddRow("Contas", Markup.Escape($"{c.Prefix}_{1.ToString($"D{c.AccountWidth}")} ... {c.Prefix}_{c.BotCount.ToString($"D{c.AccountWidth}")}"));
             table.AddRow("Ping / virar", $"{c.KeepAliveIntervalMs:F0} ms / {c.IdleTurnIntervalMs:F0} ms");
-            table.AddRow("Login-Only", c.LoginOnly ? "[yellow]Sim[/]" : "Não");
+            table.AddRow("Modo", c.EffectiveWorkloadMode.ToString());
             table.AddRow("Atacar", c.EnableAttack ? "[green]Sim[/]" : "[grey]Não[/]");
             table.AddRow("Andar", c.EnableRandomWalk ? "[green]Sim[/]" : "[grey]Não[/]");
             table.AddRow("Spells", c.EnableSpell ? "[green]Sim[/]" : "[grey]Não[/]");
@@ -323,13 +356,35 @@ namespace StressBotBenchmark
         {
             if (Console.IsOutputRedirected)
             {
+                CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+                using var process = Process.GetCurrentProcess();
+                long previous = Stopwatch.GetTimestamp();
+                var cpu = process.TotalProcessorTime;
+                int previousActions = metrics.Actions, previousPackets = metrics.Sent;
+                long previousIn = metrics.BytesIn, previousOut = metrics.BytesOut;
                 while (!token.IsCancellationRequested)
                 {
+                    long now = Stopwatch.GetTimestamp();
+                    double seconds = Math.Max(0.001, Stopwatch.GetElapsedTime(previous, now).TotalSeconds);
+                    process.Refresh();
+                    var currentCpu = process.TotalProcessorTime;
+                    int inWorld = bots.Count(b => b.InWorld);
+                    double actionsPerBot = inWorld == 0 ? 0 : (metrics.Actions - previousActions) / seconds / inWorld;
+                    Console.WriteLine($"Mode={config.EffectiveWorkloadMode} Seed={config.RandomSeed} " +
+                        $"ActionsPerSecPerBot={actionsPerBot:F3} PacketsPerSec={(metrics.Sent - previousPackets) / seconds:F1} " +
+                        $"BytesInPerSec={(metrics.BytesIn - previousIn) / seconds:F1} BytesOutPerSec={(metrics.BytesOut - previousOut) / seconds:F1} " +
+                        $"BotCpuOneCore={(currentCpu - cpu).TotalSeconds / seconds * 100:F2} BotRssMiB={process.WorkingSet64 / 1048576.0:F2} " +
+                        $"Idle={bots.Count(b => b.InWorld && b.Activity == AI.ActivityState.Idle)} Walking={bots.Count(b => b.InWorld && b.Activity == AI.ActivityState.Walking)} " +
+                        $"Combat={bots.Count(b => b.InWorld && b.Activity == AI.ActivityState.Combat)} Social={bots.Count(b => b.InWorld && b.Activity == AI.ActivityState.Social)} " +
+                        $"QueueP95Ms={metrics.QueueP95Ms} QueueP99Ms={metrics.QueueP99Ms} SendP95Ms={metrics.SendP95Ms} SendP99Ms={metrics.SendP99Ms}");
                     Console.WriteLine($"{DateTime.Now:HH:mm:ss} InWorld={bots.Count(b => b.InWorld)}/{config.BotCount} TCP={metrics.ConnectedCount} Failures={metrics.ConnectionFailures} Disconnects={metrics.Disconnects} Reconnects={metrics.Reconnects} Ping={metrics.Pingbacks} Turns={metrics.Turns} " +
                         $"PacketsIn={metrics.PacketsIn} PacketsOut={metrics.Sent} BytesIn={metrics.BytesIn} BytesOut={metrics.BytesOut} " +
-                        $"Walks={metrics.Walks} Attacks={metrics.Attacks} Spells={metrics.Spells} Chats={metrics.Chats} " +
-                        $"Dropped={metrics.Dropped} QueueFull={metrics.QueueFull} ParserErrors={metrics.ParserErrors} UnknownOpcodes={metrics.UnknownOpcodes} LastError={metrics.LastError ?? "none"}");
-                    await Task.Delay(TimeSpan.FromSeconds(5), token);
+                        $"Walks={metrics.Walks} Attacks={metrics.Attacks} Spells={metrics.Spells} Heals={metrics.Heals} Potions={metrics.Potions} Chats={metrics.Chats} Outfits={metrics.Outfits} " +
+                        $"Dropped={metrics.Dropped} QueueFull={metrics.QueueFull} ParserErrors={metrics.ParserErrors} UnknownOpcodes={metrics.UnknownOpcodes} UnknownSummary={metrics.UnknownSummary} LastParserError={metrics.LastParserError ?? "none"} LastError={metrics.LastError ?? "none"}");
+                    previous = now; cpu = currentCpu;
+                    previousActions = metrics.Actions; previousPackets = metrics.Sent;
+                    previousIn = metrics.BytesIn; previousOut = metrics.BytesOut;
+                    await Task.Delay(TimeSpan.FromMilliseconds(config.DashboardIntervalMs), token);
                 }
                 return;
             }
@@ -348,7 +403,7 @@ namespace StressBotBenchmark
                     while (!token.IsCancellationRequested)
                     {
                         await Task.Delay((int)config.DashboardIntervalMs, token);
-                        
+
                         long bytesInNow = metrics.BytesIn;
                         long bytesOutNow = metrics.BytesOut;
                         int packetsInNow = metrics.PacketsIn;
@@ -377,7 +432,7 @@ namespace StressBotBenchmark
 
                         int trackedMonstersTotal = bots.Sum(b => b.TrackedMonstersTotal);
 
-                        int actions = metrics.Walks + metrics.Attacks + metrics.Spells + metrics.Chats + metrics.Turns;
+                        int actions = metrics.Actions;
                         double actionsPerBot = inWorldCount > 0 ? (actions - lastActions) / sampleSeconds / inWorldCount : 0;
                         lastActions = actions;
 
@@ -395,8 +450,8 @@ namespace StressBotBenchmark
                         table.AddColumn(new TableColumn("[bold teal]Global Totals[/]").Centered());
 
                         table.AddRow(
-                            "Status", 
-                            $"[{statusColor}]In-World: {inWorldCount} / {target}[/]", 
+                            "Status",
+                            $"[{statusColor}]In-World: {inWorldCount} / {target}[/]",
                             $"[{statusColor}]Disc: {metrics.Disconnects} | Reconn: {metrics.Reconnects}[/]"
                         );
                         table.AddRow("Conexões", $"TCP: {metrics.ConnectedCount} | Falhas TCP: {metrics.ConnectionFailures}", $"Ping: {metrics.Pingbacks} | Turns: {metrics.Turns}");
@@ -414,13 +469,13 @@ namespace StressBotBenchmark
                             );
                         }
                         table.AddRow(
-                            "Network", 
+                            "Network",
                             $"[blue]In:[/] {bytesInSec / sampleSeconds / 1024.0:F1} KB/s | [fuchsia]Out:[/] {bytesOutSec / sampleSeconds / 1024.0:F1} KB/s",
                             $"Pkt In: [blue]{metrics.PacketsIn}[/] | Out: [fuchsia]{metrics.Sent}[/]"
                         );
                         table.AddRow(
-                            "Actions (/sec)", 
-                            $"[orange3]Actions/s/Bot:[/] {actionsPerBot:F2}", 
+                            "Actions (/sec)",
+                            $"[orange3]Actions/s/Bot:[/] {actionsPerBot:F2}",
                             $"Atk: {metrics.Attacks} | Wlk: {metrics.Walks} | Mgc: {metrics.Spells}"
                         );
                         table.AddRow(
