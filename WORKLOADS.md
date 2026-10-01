@@ -61,6 +61,12 @@ they are cumulative for the run, not rolling exact percentiles. No sample list
 grows with packet count. Serial decisions avoid accumulating duplicate queued
 actions; no packet-coalescing mechanism is claimed.
 
+Headless logs also expose queue/send averages and maxima, packets/s/bot, and
+separate stale drops from queue-full rejections. Age-dropped waits are included
+in the queue histogram; silently excluding the slowest rejected requests would
+make its tail misleading. TORTURE reports `ActiveContinuous`, not the unused
+REALISTIC schedule's initial state distribution.
+
 The default global login delay remains 650 ms. An explicitly smaller delay is
 honored with a warning and applies to retries too. Use it only with compatible
 limits on an isolated server. Never raise production IP or packet limits merely

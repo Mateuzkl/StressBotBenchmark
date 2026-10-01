@@ -36,6 +36,7 @@ namespace StressBotBenchmark
         private int _enqueued;
         private int _sent;
         private int _dropped;
+        private int _staleDropped;
         private int _queueFull;
         private int _pingbacks;
         private int _walks;
@@ -56,6 +57,7 @@ namespace StressBotBenchmark
         private double _maxSendLagMs;
         private readonly object _lagLock = new object();
         private double _queueWaitMsSum;
+        private double _maxQueueWaitMs;
         private long _queueWaitSamples;
         // Fixed-size cumulative histograms; no per-packet allocations or unbounded samples.
         private static readonly double[] LagBounds = { 0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2000, 5000, double.PositiveInfinity };
@@ -65,6 +67,7 @@ namespace StressBotBenchmark
         public int Enqueued => _enqueued;
         public int Sent => _sent;
         public int Dropped => _dropped;
+        public int StaleDropped => Volatile.Read(ref _staleDropped);
         public int QueueFull => _queueFull;
         public int Pingbacks => _pingbacks;
         public int Walks => _walks;
@@ -84,6 +87,7 @@ namespace StressBotBenchmark
         public double AvgDrainMs { get { lock (_lagLock) return _drainSamples > 0 ? _drainMsSum / _drainSamples : 0; } }
         public double MaxSendLagMs { get { lock (_lagLock) return _maxSendLagMs; } }
         public double AvgQueueWaitMs { get { lock (_lagLock) return _queueWaitSamples > 0 ? _queueWaitMsSum / _queueWaitSamples : 0; } }
+        public double MaxQueueWaitMs { get { lock (_lagLock) return _maxQueueWaitMs; } }
         public double QueueP95Ms { get { lock (_lagLock) return Percentile(_queueHistogram, _queueWaitSamples, 0.95); } }
         public double QueueP99Ms { get { lock (_lagLock) return Percentile(_queueHistogram, _queueWaitSamples, 0.99); } }
         public double SendP95Ms { get { lock (_lagLock) return Percentile(_sendHistogram, _drainSamples, 0.95); } }
@@ -103,12 +107,19 @@ namespace StressBotBenchmark
         }
         public void AddQueueWaitMs(double ms)
         {
-            lock (_lagLock) { _queueWaitMsSum += ms; _queueWaitSamples++; AddSample(_queueHistogram, ms); }
+            lock (_lagLock)
+            {
+                _queueWaitMsSum += ms;
+                _queueWaitSamples++;
+                _maxQueueWaitMs = Math.Max(_maxQueueWaitMs, ms);
+                AddSample(_queueHistogram, ms);
+            }
         }
 
         public void IncEnqueued() => Interlocked.Increment(ref _enqueued);
         public void IncSent() => Interlocked.Increment(ref _sent);
         public void IncDropped() => Interlocked.Increment(ref _dropped);
+        public void IncStaleDropped() { Interlocked.Increment(ref _staleDropped); IncDropped(); }
         public void IncQueueFull() => Interlocked.Increment(ref _queueFull);
         public void IncPingbacks() => Interlocked.Increment(ref _pingbacks);
         public void IncWalks() => Interlocked.Increment(ref _walks);

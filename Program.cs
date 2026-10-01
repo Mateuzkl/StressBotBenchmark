@@ -370,17 +370,22 @@ namespace StressBotBenchmark
                     var currentCpu = process.TotalProcessorTime;
                     int inWorld = bots.Count(b => b.InWorld);
                     double actionsPerBot = inWorld == 0 ? 0 : (metrics.Actions - previousActions) / seconds / inWorld;
+                    double packetsPerSecond = (metrics.Sent - previousPackets) / seconds;
+                    string activity = config.EffectiveWorkloadMode == WorkloadMode.TORTURE
+                        ? $"ActiveContinuous={inWorld}"
+                        : $"Idle={bots.Count(b => b.InWorld && b.Activity == AI.ActivityState.Idle)} Walking={bots.Count(b => b.InWorld && b.Activity == AI.ActivityState.Walking)} " +
+                          $"Combat={bots.Count(b => b.InWorld && b.Activity == AI.ActivityState.Combat)} Social={bots.Count(b => b.InWorld && b.Activity == AI.ActivityState.Social)}";
                     Console.WriteLine($"Mode={config.EffectiveWorkloadMode} Seed={config.RandomSeed} " +
-                        $"ActionsPerSecPerBot={actionsPerBot:F3} PacketsPerSec={(metrics.Sent - previousPackets) / seconds:F1} " +
+                        $"ActionsPerSecPerBot={actionsPerBot:F3} PacketsPerSec={packetsPerSecond:F1} PacketsPerSecPerBot={(inWorld == 0 ? 0 : packetsPerSecond / inWorld):F3} " +
                         $"BytesInPerSec={(metrics.BytesIn - previousIn) / seconds:F1} BytesOutPerSec={(metrics.BytesOut - previousOut) / seconds:F1} " +
                         $"BotCpuOneCore={(currentCpu - cpu).TotalSeconds / seconds * 100:F2} BotRssMiB={process.WorkingSet64 / 1048576.0:F2} " +
-                        $"Idle={bots.Count(b => b.InWorld && b.Activity == AI.ActivityState.Idle)} Walking={bots.Count(b => b.InWorld && b.Activity == AI.ActivityState.Walking)} " +
-                        $"Combat={bots.Count(b => b.InWorld && b.Activity == AI.ActivityState.Combat)} Social={bots.Count(b => b.InWorld && b.Activity == AI.ActivityState.Social)} " +
-                        $"QueueP95Ms={metrics.QueueP95Ms} QueueP99Ms={metrics.QueueP99Ms} SendP95Ms={metrics.SendP95Ms} SendP99Ms={metrics.SendP99Ms}");
+                        $"{activity} QueueAvgMs={metrics.AvgQueueWaitMs:F3} QueueMaxMs={metrics.MaxQueueWaitMs:F3} " +
+                        $"QueueP95Ms={metrics.QueueP95Ms} QueueP99Ms={metrics.QueueP99Ms} " +
+                        $"SendAvgMs={metrics.AvgDrainMs:F3} SendMaxMs={metrics.MaxSendLagMs:F3} SendP95Ms={metrics.SendP95Ms} SendP99Ms={metrics.SendP99Ms}");
                     Console.WriteLine($"{DateTime.Now:HH:mm:ss} InWorld={bots.Count(b => b.InWorld)}/{config.BotCount} TCP={metrics.ConnectedCount} Failures={metrics.ConnectionFailures} Disconnects={metrics.Disconnects} Reconnects={metrics.Reconnects} Ping={metrics.Pingbacks} Turns={metrics.Turns} " +
                         $"PacketsIn={metrics.PacketsIn} PacketsOut={metrics.Sent} BytesIn={metrics.BytesIn} BytesOut={metrics.BytesOut} " +
                         $"Walks={metrics.Walks} Attacks={metrics.Attacks} Spells={metrics.Spells} Heals={metrics.Heals} Potions={metrics.Potions} Chats={metrics.Chats} Outfits={metrics.Outfits} " +
-                        $"Dropped={metrics.Dropped} QueueFull={metrics.QueueFull} ParserErrors={metrics.ParserErrors} UnknownOpcodes={metrics.UnknownOpcodes} UnknownSummary={metrics.UnknownSummary} LastParserError={metrics.LastParserError ?? "none"} LastError={metrics.LastError ?? "none"}");
+                        $"Dropped={metrics.Dropped} StaleDropped={metrics.StaleDropped} QueueFull={metrics.QueueFull} ParserErrors={metrics.ParserErrors} UnknownOpcodes={metrics.UnknownOpcodes} UnknownSummary={metrics.UnknownSummary} LastParserError={metrics.LastParserError ?? "none"} LastError={metrics.LastError ?? "none"}");
                     previous = now; cpu = currentCpu;
                     previousActions = metrics.Actions; previousPackets = metrics.Sent;
                     previousIn = metrics.BytesIn; previousOut = metrics.BytesOut;

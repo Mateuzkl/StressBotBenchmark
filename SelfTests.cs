@@ -101,6 +101,8 @@ internal static class SelfTests
             if (await Submit(true, CancellationToken.None)) throw new InvalidOperationException("Queue overflow was sent.");
             if (await queued || metrics.QueueFull != 1 || metrics.Dropped != 2 || metrics.Sent != 0)
                 throw new InvalidOperationException("Production send admission ignored its capacity or age limit.");
+            if (metrics.StaleDropped != 1 || metrics.MaxQueueWaitMs < config.MaxSendLagMsToDrop || metrics.QueueP99Ms < config.MaxSendLagMsToDrop)
+                throw new InvalidOperationException("Stale queue waits were omitted from telemetry.");
             using var cancel = new CancellationTokenSource(100);
             try { await Submit(false, cancel.Token); throw new InvalidOperationException("Blocked critical write completed."); }
             catch (OperationCanceledException) { }

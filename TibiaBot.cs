@@ -404,7 +404,8 @@ namespace StressBotBenchmark
                 try { await _writeLock.WaitAsync(ageLimit.Token); }
                 catch (OperationCanceledException) when (!token.IsCancellationRequested && replaceable)
                 {
-                    _metrics.IncDropped();
+                    _metrics.AddQueueWaitMs(Stopwatch.GetElapsedTime(queued).TotalMilliseconds);
+                    _metrics.IncStaleDropped();
                     return false;
                 }
                 locked = true;
@@ -417,12 +418,13 @@ namespace StressBotBenchmark
                     double remaining = 1000 / _config.MaxPacketsPerSecondPerBot - Stopwatch.GetElapsedTime(_lastSend).TotalMilliseconds;
                     if (remaining > 0) await Task.Delay(TimeSpan.FromMilliseconds(remaining), token);
                 }
-                if (replaceable && Stopwatch.GetElapsedTime(queued).TotalMilliseconds >= _config.MaxSendLagMsToDrop)
+                double queueWaitMs = Stopwatch.GetElapsedTime(queued).TotalMilliseconds;
+                _metrics.AddQueueWaitMs(queueWaitMs);
+                if (replaceable && queueWaitMs >= _config.MaxSendLagMsToDrop)
                 {
-                    _metrics.IncDropped();
+                    _metrics.IncStaleDropped();
                     return false;
                 }
-                _metrics.AddQueueWaitMs(Stopwatch.GetElapsedTime(queued).TotalMilliseconds);
                 var stream = _stream ?? throw new IOException("Stream is closed.");
                 long started = Stopwatch.GetTimestamp();
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
