@@ -22,7 +22,8 @@ public sealed class CombatBehavior
     {
         var player = ctx.World.Player;
 
-        // 1. Attack packet (0xA1): send if target changed or at least every 4s to maintain target
+        // 1. Attack packet (0xA1): select changed targets; refresh only when the
+        // workload needs it, at the configured scan interval.
         bool refresh = ctx.Config.EffectiveWorkloadMode == WorkloadMode.TORTURE || player.CurrentTargetId != target.Id;
         if (_lastAttackedTargetId != target.Id || (refresh &&
             (DateTime.UtcNow - _lastAttackPacketSent).TotalMilliseconds >= ctx.Config.AttackScanIntervalMs))

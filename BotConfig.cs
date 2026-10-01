@@ -118,8 +118,8 @@ namespace StressBotBenchmark
         public int QueueSize { get; set; } = 32;
         public int MaxSendLagMsToDrop { get; set; } = 1200;
         public double PingbackMinIntervalMs { get; set; } = 5000;
-        // OS 2 / TFS 8.60 accepts periodic 0x1E heartbeats, including when its
-        // ping is bundled after map data that the lightweight parser skips.
+        // Optional OS 2 / TFS 8.60 heartbeat. Server-requested pongs are handled
+        // independently by the read loop, including after parsed map data.
         public double KeepAliveIntervalMs { get; set; } = 5000;
         // Turn in place to reset TFS's separate idle timer. Zero disables it.
         public double IdleTurnIntervalMs { get; set; } = 60000;

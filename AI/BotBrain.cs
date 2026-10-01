@@ -8,7 +8,7 @@ using System.Diagnostics;
 namespace StressBotBenchmark.AI;
 
 /// <summary>
-/// Unified brain evaluating per-bot decisions on a periodic tick (~150-250ms).
+/// Serial decision loop with workload-specific, seeded tick intervals.
 /// Replaces the independent conflicting loops with a single priority-driven state machine:
 /// 1. Healing
 /// 2. Potion
