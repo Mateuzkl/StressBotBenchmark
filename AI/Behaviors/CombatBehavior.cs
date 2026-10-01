@@ -16,13 +16,16 @@ public sealed class CombatBehavior
 {
     private DateTime _lastAttackPacketSent = DateTime.MinValue;
     private uint _lastAttackedTargetId = 0;
+    public void Reset() => _lastAttackedTargetId = 0;
 
     public OutputMessage? Evaluate(DecisionContext ctx, CreatureState target)
     {
         var player = ctx.World.Player;
 
         // 1. Attack packet (0xA1): send if target changed or at least every 4s to maintain target
-        if (_lastAttackedTargetId != target.Id || (DateTime.UtcNow - _lastAttackPacketSent).TotalSeconds >= 4.0)
+        bool refresh = ctx.Config.EffectiveWorkloadMode == WorkloadMode.TORTURE || player.CurrentTargetId != target.Id;
+        if (_lastAttackedTargetId != target.Id || (refresh &&
+            (DateTime.UtcNow - _lastAttackPacketSent).TotalMilliseconds >= ctx.Config.AttackScanIntervalMs))
         {
             _lastAttackedTargetId = target.Id;
             _lastAttackPacketSent = DateTime.UtcNow;

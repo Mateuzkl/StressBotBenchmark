@@ -36,7 +36,7 @@ public sealed class ChatBehavior
         string msg = pool[ctx.Persona.Rng.Next(pool.Count)];
 
         // Long cooldown between 20s and 60s
-        int cdMs = ctx.Persona.Rng.Next(20000, 60000);
+        int cdMs = Math.Max(1, (int)(ctx.Config.ChatIntervalMs * (0.9 + ctx.Persona.Rng.NextDouble() * 0.2)));
         ctx.Cooldowns.SetCooldown("chat_cd", cdMs);
 
         return Protocol860Writer.Say(msg, 1);

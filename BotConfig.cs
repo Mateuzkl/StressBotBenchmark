@@ -1,8 +1,12 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using StressBotBenchmark.AI;
 
 namespace StressBotBenchmark
 {
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public enum WorkloadMode { LOGIN_ONLY, REALISTIC, TORTURE }
+
     // ── Vocação ─────────────────────────────────────────────
     [JsonConverter(typeof(JsonStringEnumConverter))]
     public enum Vocation
@@ -59,6 +63,7 @@ namespace StressBotBenchmark
     {
         // ─── Conexão ────────────────────────────────────────
         public string Host { get; set; } = "127.0.0.1";
+        public string? ItemsOtbPath { get; set; }
         public int Port { get; set; } = 7172;
 
         // ─── Contas ─────────────────────────────────────────
@@ -95,6 +100,20 @@ namespace StressBotBenchmark
         // ─── Sistema ────────────────────────────────────────
         public double DashboardIntervalMs { get; set; } = 1000;
         public bool LoginOnly { get; set; } = false;
+        public WorkloadMode WorkloadMode { get; set; } = WorkloadMode.REALISTIC;
+        [JsonIgnore]
+        public WorkloadMode EffectiveWorkloadMode => LoginOnly ? WorkloadMode.LOGIN_ONLY : WorkloadMode;
+        public bool LoginOnlyKeepAliveEnabled { get; set; } = false;
+        public bool LoginOnlyIdleTurnEnabled { get; set; } = false;
+        public bool EnableOutfit { get; set; } = false;
+        public int? AiTickIntervalMinMs { get; set; }
+        public int? AiTickIntervalMaxMs { get; set; }
+        [JsonIgnore]
+        public int EffectiveAiTickMinMs => AiTickIntervalMinMs ?? (EffectiveWorkloadMode == WorkloadMode.TORTURE ? 175 : 500);
+        [JsonIgnore]
+        public int EffectiveAiTickMaxMs => AiTickIntervalMaxMs ?? (EffectiveWorkloadMode == WorkloadMode.TORTURE ? 225 : 1000);
+        public double MaxPacketsPerSecondPerBot { get; set; } = 18;
+        public ActivityWeights ActivityWeights { get; set; } = new();
         public bool Reconnect { get; set; } = true;
         public int QueueSize { get; set; } = 32;
         public int MaxSendLagMsToDrop { get; set; } = 1200;

@@ -3,6 +3,7 @@ using StressBotBenchmark.Navigation;
 using StressBotBenchmark.Network;
 using StressBotBenchmark.Protocol;
 using StressBotBenchmark.World;
+using System.Diagnostics;
 
 namespace StressBotBenchmark.AI;
 
@@ -34,6 +35,9 @@ public sealed class BotBrain
     private readonly OutfitBehavior _outfit = new();
 
     private bool _fightModesSent = false;
+    private readonly WorkloadSchedule _schedule;
+    private readonly long _started = Stopwatch.GetTimestamp();
+    public ActivityState ActivityState => _schedule.State;
 
     public BotBrain(WorldState world, BotConfig config, int seed, VocationProfile? vocation = null)
     {
@@ -41,6 +45,7 @@ public sealed class BotBrain
         _config = config;
         _persona = new BotPersona(seed, vocation ?? config.VocationConfig);
         _nav = new NavigationEngine(world);
+        _schedule = new WorkloadSchedule(config.ActivityWeights, StableSeed.For("activity", seed));
     }
 
     public BotPersona Persona => _persona;
@@ -53,6 +58,19 @@ public sealed class BotBrain
     /// </summary>
     public OutputMessage? Tick()
     {
+        if (_config.EffectiveWorkloadMode == WorkloadMode.LOGIN_ONLY) return null;
+        bool realistic = _config.EffectiveWorkloadMode == WorkloadMode.REALISTIC;
+        ActivityState previous = _schedule.State;
+        if (realistic && _schedule.Advance((long)Stopwatch.GetElapsedTime(_started).TotalMilliseconds))
+        {
+            if (previous == ActivityState.Combat)
+            {
+                _target.ClearTarget(_world);
+                _combat.Reset();
+                return Protocol860Writer.Attack(0);
+            }
+            if (previous == ActivityState.Walking) return Protocol860Writer.StopAutoWalk();
+        }
         var ctx = new DecisionContext(_world, _persona, _cooldowns, _config);
 
         // 0. Initial Fight Modes sync
@@ -75,8 +93,19 @@ public sealed class BotBrain
         if (potionAction != null)
             return potionAction;
 
+        if (realistic && ActivityState == ActivityState.Idle) return null;
+
+        bool combat = !realistic || ActivityState == ActivityState.Combat;
+        bool walking = !realistic || ActivityState == ActivityState.Walking || combat;
+        bool social = !realistic || ActivityState == ActivityState.Social;
+
         // 3. Target acquisition (STRICT: Monsters only)
-        var targetCreature = _config.EnableAttack ? _target.UpdateTarget(_world) : null;
+        var targetCreature = combat && _config.EnableAttack ? _target.GetCurrentTarget(_world) : null;
+        if (combat && _config.EnableAttack && targetCreature == null && _cooldowns.IsReady("target_scan"))
+        {
+            _cooldowns.SetCooldown("target_scan", Math.Max(1, (int)_config.AttackScanIntervalMs));
+            targetCreature = _target.UpdateTarget(_world);
+        }
 
         // 4. Combat action (attack packet or offensive spell)
         // STRICT RULE: Offensive spells and attacks ONLY trigger when targetCreature is valid!
@@ -88,7 +117,7 @@ public sealed class BotBrain
         }
 
         // 5. Movement (Chase, Kite, or Explore)
-        if (_nav.CanMove())
+        if (walking && _cooldowns.IsReady("move_interval") && _nav.CanMove())
         {
             // If in combat with a valid monster:
             if (targetCreature != null)
@@ -101,7 +130,7 @@ public sealed class BotBrain
                     var kiteStep = _nav.PlanKite(targetCreature, _persona.PreferredRange);
                     if (kiteStep.HasValue)
                     {
-                        _nav.OnMoveSent();
+                        OnMovePlanned();
                         byte opcode = Protocol860Writer.DirectionToOpcode(kiteStep.Value.Dx, kiteStep.Value.Dy);
                         return Protocol860Writer.MoveStep(opcode);
                     }
@@ -112,7 +141,7 @@ public sealed class BotBrain
                     var chaseSteps = _nav.PlanChase(targetCreature, _persona.PreferredRange);
                     if (chaseSteps.Count > 0)
                     {
-                        _nav.OnMoveSent();
+                        OnMovePlanned();
                         if (chaseSteps.Count > 1)
                         {
                             return Protocol860Writer.AutoWalk(chaseSteps);
@@ -126,12 +155,12 @@ public sealed class BotBrain
                 }
             }
             // No target or not attacking: natural wander/explore if enabled
-            else if (_config.EnableRandomWalk)
+            else if (_config.EnableRandomWalk && (!realistic || ActivityState == ActivityState.Walking))
             {
                 var step = _nav.PlanWander(_persona.Rng);
                 if (step.HasValue)
                 {
-                    _nav.OnMoveSent();
+                    OnMovePlanned();
                     byte opcode = Protocol860Writer.DirectionToOpcode(step.Value.Dx, step.Value.Dy);
                     return Protocol860Writer.MoveStep(opcode);
                 }
@@ -139,15 +168,24 @@ public sealed class BotBrain
         }
 
         // 6. Rare humanized Chat
-        var chatAction = _chat.Evaluate(ctx);
+        var chatAction = social ? _chat.Evaluate(ctx) : null;
         if (chatAction != null)
             return chatAction;
 
         // 7. Rare Outfit cosmetic
-        var outfitAction = _outfit.Evaluate(ctx);
+        var outfitAction = social && _config.EnableOutfit ? _outfit.Evaluate(ctx) : null;
         if (outfitAction != null)
             return outfitAction;
 
         return null;
     }
+
+    private void OnMovePlanned()
+    {
+        _nav.OnMoveSent();
+        _cooldowns.SetCooldown("move_interval", Math.Max(1,
+            (int)(_config.WalkIntervalMs * (0.9 + _persona.Rng.NextDouble() * 0.2))));
+    }
+
+    public void OnActionDropped() => _combat.Reset();
 }
